@@ -1,13 +1,12 @@
 """ Unit tests for the system interface."""
 
 import unittest
-from six import assertRaisesRegex
 
 import numpy as np
 
 from openmdao.api import Problem, Group, IndepVarComp, ExecComp
 from openmdao.test_suite.components.options_feature_vector import VectorDoublingComp
-from openmdao.utils.assert_utils import assert_rel_error, assert_warning
+from openmdao.utils.assert_utils import assert_near_equal, assert_warning
 
 
 class TestSystem(unittest.TestCase):
@@ -115,7 +114,7 @@ class TestSystem(unittest.TestCase):
         p.set_solver_print(level=0)
         p.run_model()
 
-        msg = "Incompatible shape for '.*': Expected (.*) but got (.*)"
+        msg = "Group (.*): Failed to set value of '.*': could not broadcast input array from shape (.*) into shape (.*)."
 
         num_val = -10
         arr_val = -10*np.ones((5, 1))
@@ -127,27 +126,27 @@ class TestSystem(unittest.TestCase):
         #
 
         # assign array to scalar
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             inputs['C1.a'] = arr_val
 
         # assign scalar to array
         inputs['C2.x'] = num_val
-        assert_rel_error(self, inputs['C2.x'], arr_val, 1e-10)
+        assert_near_equal(inputs['C2.x'], arr_val, 1e-10)
 
         # assign array to array
         inputs['C2.x'] = arr_val
-        assert_rel_error(self, inputs['C2.x'], arr_val, 1e-10)
+        assert_near_equal(inputs['C2.x'], arr_val, 1e-10)
 
         # assign bad array shape to array
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             inputs['C2.x'] = bad_val
 
         # assign list to array
         inputs['C2.x'] = arr_val.tolist()
-        assert_rel_error(self, inputs['C2.x'], arr_val, 1e-10)
+        assert_near_equal(inputs['C2.x'], arr_val, 1e-10)
 
         # assign bad list shape to array
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             inputs['C2.x'] = bad_val.tolist()
 
         #
@@ -155,27 +154,27 @@ class TestSystem(unittest.TestCase):
         #
 
         # assign array to scalar
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             outputs['C1.b'] = arr_val
 
         # assign scalar to array
         outputs['C2.y'] = num_val
-        assert_rel_error(self, outputs['C2.y'], arr_val, 1e-10)
+        assert_near_equal(outputs['C2.y'], arr_val, 1e-10)
 
         # assign array to array
         outputs['C2.y'] = arr_val
-        assert_rel_error(self, outputs['C2.y'], arr_val, 1e-10)
+        assert_near_equal(outputs['C2.y'], arr_val, 1e-10)
 
         # assign bad array shape to array
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             outputs['C2.y'] = bad_val
 
         # assign list to array
         outputs['C2.y'] = arr_val.tolist()
-        assert_rel_error(self, outputs['C2.y'], arr_val, 1e-10)
+        assert_near_equal(outputs['C2.y'], arr_val, 1e-10)
 
         # assign bad list shape to array
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             outputs['C2.y'] = bad_val.tolist()
 
         #
@@ -183,77 +182,92 @@ class TestSystem(unittest.TestCase):
         #
 
         # assign array to scalar
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             residuals['C1.b'] = arr_val
 
         # assign scalar to array
         residuals['C2.y'] = num_val
-        assert_rel_error(self, residuals['C2.y'], arr_val, 1e-10)
+        assert_near_equal(residuals['C2.y'], arr_val, 1e-10)
 
         # assign array to array
         residuals['C2.y'] = arr_val
-        assert_rel_error(self, residuals['C2.y'], arr_val, 1e-10)
+        assert_near_equal(residuals['C2.y'], arr_val, 1e-10)
 
         # assign bad array shape to array
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             residuals['C2.y'] = bad_val
 
         # assign list to array
         residuals['C2.y'] = arr_val.tolist()
-        assert_rel_error(self, residuals['C2.y'], arr_val, 1e-10)
+        assert_near_equal(residuals['C2.y'], arr_val, 1e-10)
 
         # assign bad list shape to array
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             residuals['C2.y'] = bad_val.tolist()
 
-    def test_deprecated_solver_names(self):
-        class DummySolver():
-            pass
+    def test_list_inputs_output_with_includes_excludes(self):
+        from openmdao.test_suite.scripts.circuit_analysis import Circuit
 
-        model = Group()
+        p = Problem()
+        model = p.model
 
-        # check nl_solver setter & getter
-        msg = "The 'nl_solver' attribute provides backwards compatibility " \
-              "with OpenMDAO 1.x ; use 'nonlinear_solver' instead."
+        model.add_subsystem('ground', IndepVarComp('V', 0., units='V'))
+        model.add_subsystem('source', IndepVarComp('I', 0.1, units='A'))
+        model.add_subsystem('circuit', Circuit())
 
-        with assert_warning(DeprecationWarning, msg):
-            model.nl_solver = DummySolver()
+        model.connect('source.I', 'circuit.I_in')
+        model.connect('ground.V', 'circuit.Vg')
 
-        with assert_warning(DeprecationWarning, msg):
-            solver = model.nl_solver
+        p.setup()
+        p.run_model()
 
-        self.assertTrue(isinstance(solver, DummySolver))
+        # Inputs with no includes or excludes
+        inputs = model.list_inputs(out_stream=None)
+        self.assertEqual(len(inputs), 11)
 
-        # check ln_solver setter & getter
-        msg = "The 'ln_solver' attribute provides backwards compatibility " \
-              "with OpenMDAO 1.x ; use 'linear_solver' instead."
+        # Inputs with includes
+        inputs = model.list_inputs(includes=['*V_out*'], out_stream=None)
+        self.assertEqual(len(inputs), 3)
 
-        with assert_warning(DeprecationWarning, msg):
-            model.ln_solver = DummySolver()
+        # Inputs with includes matching a promoted name
+        inputs = model.list_inputs(includes=['*Vg*'], out_stream=None)
+        self.assertEqual(len(inputs), 2)
 
-        with assert_warning(DeprecationWarning, msg):
-            solver = model.ln_solver
+        # Inputs with excludes
+        inputs = model.list_inputs(excludes=['*V_out*'], out_stream=None)
+        self.assertEqual(len(inputs), 8)
 
-        self.assertTrue(isinstance(solver, DummySolver))
+        # Inputs with excludes matching a promoted name
+        inputs = model.list_inputs(excludes=['*Vg*'], out_stream=None)
+        self.assertEqual(len(inputs), 9)
 
-    def test_deprecated_metadata(self):
+        # Inputs with includes and excludes
+        inputs = model.list_inputs(includes=['*V_out*'], excludes=['*Vg*'], out_stream=None)
+        self.assertEqual(len(inputs), 1)
+
+        # Outputs with no includes or excludes. Explicit only
+        outputs = model.list_outputs(implicit=False, out_stream=None)
+        self.assertEqual(len(outputs), 5)
+
+        # Outputs with includes. Explicit only
+        outputs = model.list_outputs(includes=['*I'], implicit=False, out_stream=None)
+        self.assertEqual(len(outputs), 4)
+
+        # Outputs with excludes. Explicit only
+        outputs = model.list_outputs(excludes=['circuit*'], implicit=False, out_stream=None)
+        self.assertEqual(len(outputs), 2)
+
+    def test_recording_options_deprecated(self):
         prob = Problem()
-        prob.model.add_subsystem('inputs', IndepVarComp('x', shape=3))
-        prob.model.add_subsystem('double', VectorDoublingComp())
-
-        msg = "The 'metadata' attribute provides backwards compatibility " \
-              "with earlier version of OpenMDAO; use 'options' instead."
-
+        msg = "The recording option, record_model_metadata, on System is deprecated. " \
+              "Recording of model metadata will always be done"
         with assert_warning(DeprecationWarning, msg):
-            prob.model.double.metadata['size'] = 3
+            prob.model.recording_options['record_model_metadata'] = True
 
-        prob.model.connect('inputs.x', 'double.x')
-        prob.setup()
-
-        prob['inputs.x'] = [1., 2., 3.]
-
-        prob.run_model()
-        assert_rel_error(self, prob['double.y'], [2., 4., 6.])
+        msg = "The recording option, record_metadata, on System is deprecated. " \
+              "Recording of metadata will always be done"
+        with assert_warning(DeprecationWarning, msg):
+            prob.model.recording_options['record_metadata'] = True
 
 
 if __name__ == "__main__":

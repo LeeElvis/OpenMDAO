@@ -1,12 +1,9 @@
 """Define a base class for all Drivers in OpenMDAO."""
-from __future__ import print_function
-
 from collections import OrderedDict
 import pprint
 import sys
 import os
-
-from six import iteritems, itervalues, string_types
+import weakref
 
 import numpy as np
 
@@ -14,10 +11,12 @@ from openmdao.core.total_jac import _TotalJacInfo
 from openmdao.recorders.recording_manager import RecordingManager
 from openmdao.recorders.recording_iteration_stack import Recording
 from openmdao.utils.record_util import create_local_meta, check_path
-from openmdao.utils.general_utils import simple_warning, warn_deprecation
+from openmdao.utils.general_utils import simple_warning, warn_deprecation, prom2ivc_src_dict
 from openmdao.utils.mpi import MPI
 from openmdao.utils.options_dictionary import OptionsDictionary
 import openmdao.utils.coloring as coloring_mod
+from openmdao.utils.array_utils import sizes2offsets, convert_neg
+from openmdao.vectors.vector import INT_DTYPE, _full_slice
 
 
 def _check_debug_print_opts_valid(name, opts):
@@ -58,7 +57,7 @@ class Driver(object):
     cite : str
         Listing of relevant citations that should be referenced when
         publishing work that uses this class.
-    _problem : <Problem>
+    _problem : weakref to <Problem>
         Pointer to the containing problem.
     supports : <OptionsDictionary>
         Provides a consistent way for drivers to declare what features they support.
@@ -66,6 +65,9 @@ class Driver(object):
         Contains all design variable info.
     _designvars_discrete : list
         List of design variables that are discrete.
+    _dist_driver_vars : dict
+        Dict of constraints that are distributed outputs. Key is rank, values are
+        (local indices, local sizes).
     _cons : dict
         Contains all constraint info.
     _objs : dict
@@ -124,27 +126,42 @@ class Driver(object):
         self.recording_options = OptionsDictionary(parent_name=type(self).__name__)
 
         self.recording_options.declare('record_model_metadata', types=bool, default=True,
-                                       desc='Record metadata for all Systems in the model')
+                                       desc='Deprecated. Recording of model metadata will always '
+                                       'be done',
+                                       deprecation="The recording option, record_model_metadata, "
+                                       "on Driver is "
+                                       "deprecated. Recording of model metadata will always "
+                                       "be done",
+                                       )
         self.recording_options.declare('record_desvars', types=bool, default=True,
                                        desc='Set to True to record design variables at the '
                                             'driver level')
         self.recording_options.declare('record_responses', types=bool, default=False,
-                                       desc='Set to True to record responses at the driver level')
+                                       desc='Set True to record constraints and objectives at the '
+                                            'driver level')
+
         self.recording_options.declare('record_objectives', types=bool, default=True,
                                        desc='Set to True to record objectives at the driver level')
         self.recording_options.declare('record_constraints', types=bool, default=True,
                                        desc='Set to True to record constraints at the '
                                             'driver level')
         self.recording_options.declare('includes', types=list, default=[],
-                                       desc='Patterns for variables to include in recording')
+                                       desc='Patterns for variables to include in recording. '
+                                       'Uses fnmatch wildcards')
         self.recording_options.declare('excludes', types=list, default=[],
                                        desc='Patterns for vars to exclude in recording '
-                                            '(processed post-includes)')
+                                            '(processed post-includes). Uses fnmatch wildcards')
         self.recording_options.declare('record_derivatives', types=bool, default=False,
                                        desc='Set to True to record derivatives at the driver '
                                             'level')
         self.recording_options.declare('record_inputs', types=bool, default=True,
                                        desc='Set to True to record inputs at the driver level')
+        self.recording_options.declare('record_outputs', types=bool, default=True,
+                                       desc='Set True to record outputs at the '
+                                            'driver level.')
+        self.recording_options.declare('record_residuals', types=bool, default=False,
+                                       desc='Set True to record residuals at the '
+                                            'driver level.')
 
         # What the driver supports.
         self.supports = OptionsDictionary(parent_name=type(self).__name__)
@@ -153,7 +170,7 @@ class Driver(object):
         self.supports.declare('linear_constraints', types=bool, default=False)
         self.supports.declare('two_sided_constraints', types=bool, default=False)
         self.supports.declare('multiple_objectives', types=bool, default=False)
-        self.supports.declare('integer_design_vars', types=bool, default=False)
+        self.supports.declare('integer_design_vars', types=bool, default=True)
         self.supports.declare('gradients', types=bool, default=False)
         self.supports.declare('active_set', types=bool, default=False)
         self.supports.declare('simultaneous_derivatives', types=bool, default=False)
@@ -162,8 +179,7 @@ class Driver(object):
         self.iter_count = 0
         self.cite = ""
 
-        self._coloring_info = coloring_mod._DEF_COMP_SPARSITY_ARGS.copy()
-        self._coloring_info['coloring'] = None
+        self._coloring_info = coloring_mod._get_coloring_meta()
 
         self._total_jac_sparsity = None
         self._res_jacs = {}
@@ -239,20 +255,19 @@ class Driver(object):
         problem : <Problem>
             Pointer to the containing problem.
         """
-        self._problem = problem
-        self._recording_iter = problem._recording_iter
+        self._problem = weakref.ref(problem)
         model = problem.model
 
         self._total_jac = None
 
         self._has_scaling = (
-            np.any([r['scaler'] is not None for r in itervalues(self._responses)]) or
-            np.any([dv['scaler'] is not None for dv in itervalues(self._designvars)])
+            np.any([r['total_scaler'] is not None for r in self._responses.values()]) or
+            np.any([dv['total_scaler'] is not None for dv in self._designvars.values()])
         )
 
         # Determine if any design variables are discrete.
-        self._designvars_discrete = [dv for dv in self._designvars
-                                     if dv in model._discrete_outputs]
+        self._designvars_discrete = [name for name, meta in self._designvars.items()
+                                     if meta['ivc_source'] in model._discrete_outputs]
         if not self.supports['integer_design_vars'] and len(self._designvars_discrete) > 0:
             msg = "Discrete design variables are not supported by this driver: "
             msg += '.'.join(self._designvars_discrete)
@@ -262,16 +277,23 @@ class Driver(object):
         obj_set = set()
         dv_set = set()
 
-        self._remote_dvs = dv_dict = {}
-        self._remote_cons = con_dict = {}
-        self._remote_objs = obj_dict = {}
+        self._remote_dvs = remote_dv_dict = {}
+        self._remote_cons = remote_con_dict = {}
+        self._dist_driver_vars = dist_dict = {}
+        self._remote_objs = remote_obj_dict = {}
+
+        src_design_vars = prom2ivc_src_dict(self._designvars)
+        src_cons = prom2ivc_src_dict(self._cons)
+        src_objs = prom2ivc_src_dict(self._objs)
+        responses = prom2ivc_src_dict(self._responses)
 
         # Now determine if later we'll need to allgather cons, objs, or desvars.
         if model.comm.size > 1 and model._subsystems_allprocs:
-            local_out_vars = set(model._outputs._views)
-            remote_dvs = set(self._designvars) - local_out_vars
-            remote_cons = set(self._cons) - local_out_vars
-            remote_objs = set(self._objs) - local_out_vars
+            local_out_vars = set(model._outputs._abs_iter())
+            remote_dvs = set(src_design_vars) - local_out_vars
+            remote_cons = set(src_cons) - local_out_vars
+            remote_objs = set(src_objs) - local_out_vars
+
             all_remote_vois = model.comm.allgather(
                 (remote_dvs, remote_cons, remote_objs))
             for rem_dvs, rem_cons, rem_objs in all_remote_vois:
@@ -283,20 +305,63 @@ class Driver(object):
             # to bcast to others later
             owning_ranks = model._owning_rank
             sizes = model._var_sizes['nonlinear']['output']
+            abs2meta = model._var_allprocs_abs2meta
+            rank = model.comm.rank
+            nprocs = model.comm.size
             for i, vname in enumerate(model._var_allprocs_abs_names['output']):
-                owner = owning_ranks[vname]
-                if vname in dv_set:
-                    dv_dict[vname] = (owner, sizes[owner, i])
-                if vname in con_set:
-                    con_dict[vname] = (owner, sizes[owner, i])
-                if vname in obj_set:
-                    obj_dict[vname] = (owner, sizes[owner, i])
+                if vname in responses:
+                    indices = responses[vname].get('indices')
+                elif vname in src_design_vars:
+                    indices = src_design_vars[vname].get('indices')
+                else:
+                    continue
+
+                if abs2meta[vname]['distributed']:
+
+                    idx = model._var_allprocs_abs2idx['nonlinear'][vname]
+                    dist_sizes = model._var_sizes['nonlinear']['output'][:, idx]
+                    total_dist_size = np.sum(dist_sizes)
+
+                    # Determine which indices are on our proc.
+                    offsets = sizes2offsets(dist_sizes)
+
+                    if indices is not None:
+                        indices = convert_neg(indices, total_dist_size)
+                        true_sizes = np.zeros(nprocs, dtype=INT_DTYPE)
+                        for irank in range(nprocs):
+                            dist_inds = indices[np.logical_and(indices >= offsets[irank],
+                                                               indices < (offsets[irank] +
+                                                                          dist_sizes[irank]))]
+                            if irank == rank:
+                                local_indices = dist_inds - offsets[rank]
+                                distrib_indices = dist_inds
+
+                            true_sizes[irank] = dist_inds.size
+                        dist_dict[vname] = (local_indices, true_sizes, distrib_indices)
+                    else:
+                        dist_dict[vname] = (_full_slice, dist_sizes,
+                                            slice(offsets[rank], offsets[rank] + dist_sizes[rank]))
+
+                else:
+                    owner = owning_ranks[vname]
+                    sz = sizes[owner, i]
+
+                    if vname in dv_set:
+                        remote_dv_dict[vname] = (owner, sz)
+                    if vname in con_set:
+                        remote_con_dict[vname] = (owner, sz)
+                    if vname in obj_set:
+                        remote_obj_dict[vname] = (owner, sz)
 
         self._remote_responses = self._remote_cons.copy()
         self._remote_responses.update(self._remote_objs)
 
         # set up simultaneous deriv coloring
         if coloring_mod._use_total_sparsity:
+            # reset the coloring
+            if self._coloring_info['dynamic'] or self._coloring_info['static'] is not None:
+                self._coloring_info['coloring'] = None
+
             coloring = self._get_static_coloring()
             if coloring is not None and self.supports['simultaneous_derivatives']:
                 if model._owns_approx_jac:
@@ -327,115 +392,62 @@ class Driver(object):
         dict
            Dictionary containing lists of variables to record.
         """
-        problem = self._problem
+        problem = self._problem()
         model = problem.model
-
-        if MPI:
-            # TODO: Eventually, we think we can get rid of this next check.
-            #       But to be safe, we are leaving it in there.
-            if not model.is_active():
-                raise RuntimeError("RecordingManager.startup should never be called when "
-                                   "running in parallel on an inactive System")
-            rrank = problem.comm.rank
-            rowned = model._owning_rank
 
         incl = recording_options['includes']
         excl = recording_options['excludes']
 
         # includes and excludes for outputs are specified using promoted names
-        # NOTE: only local var names are in abs2prom, all will be gathered later
-        abs2prom = model._var_abs2prom['output']
+        abs2prom = model._var_allprocs_abs2prom['output']
 
-        all_desvars = {n for n in self._designvars
-                       if n in abs2prom and check_path(abs2prom[n], incl, excl, True)}
-        all_objectives = {n for n in self._objs
-                          if n in abs2prom and check_path(abs2prom[n], incl, excl, True)}
-        all_constraints = {n for n in self._cons
-                           if n in abs2prom and check_path(abs2prom[n], incl, excl, True)}
+        # 1. If record_outputs is True, get the set of outputs
+        # 2. Filter those using includes and excludes to get the baseline set of variables to record
+        # 3. Add or remove from that set any desvars, objs, and cons based on the recording
+        #    options of those
 
-        # design variables, objectives and constraints are always in the options
-        mydesvars = myobjectives = myconstraints = set()
+        # includes and excludes for outputs are specified using _promoted_ names
+        # vectors are keyed on absolute name, discretes on relative/promoted name
+        myinputs = myoutputs = myresiduals = []
 
+        if recording_options['record_outputs']:
+            myoutputs = sorted([n for n, prom in abs2prom.items() if check_path(prom, incl, excl)])
+
+            model_outs = model._outputs
+
+            if model._var_discrete['output']:
+                # if we have discrete outputs then residual name set doesn't match output one
+                if recording_options['record_residuals']:
+                    myresiduals = [n for n in myoutputs if model_outs._contains_abs(n)]
+            elif recording_options['record_residuals']:
+                myresiduals = myoutputs
+
+        elif recording_options['record_residuals']:
+            myresiduals = [n for n in model._residuals._abs_iter()
+                           if check_path(abs2prom[n], incl, excl)]
+
+        myoutputs = set(myoutputs)
         if recording_options['record_desvars']:
-            if MPI:
-                mydesvars = [n for n in all_desvars if rrank == rowned[n]]
-            else:
-                mydesvars = list(all_desvars)
+            myoutputs.update(self._designvars)
+        if recording_options['record_objectives'] or recording_options['record_responses']:
+            myoutputs.update(self._objs)
+        if recording_options['record_constraints'] or recording_options['record_responses']:
+            myoutputs.update(self._cons)
 
-        if recording_options['record_objectives']:
-            if MPI:
-                myobjectives = [n for n in all_objectives if rrank == rowned[n]]
-            else:
-                myobjectives = list(all_objectives)
+        # inputs (if in options). inputs use _absolute_ names for includes/excludes
+        if 'record_inputs' in recording_options:
+            if recording_options['record_inputs']:
+                # sort the results since _var_allprocs_abs2prom isn't ordered
+                myinputs = sorted([n for n in model._var_allprocs_abs2prom['input']
+                                  if check_path(n, incl, excl)])
 
-        if recording_options['record_constraints']:
-            if MPI:
-                myconstraints = [n for n in all_constraints if rrank == rowned[n]]
-            else:
-                myconstraints = list(all_constraints)
-
-        filtered_vars_to_record = {
-            'des': mydesvars,
-            'obj': myobjectives,
-            'con': myconstraints
+        vars2record = {
+            'input': myinputs,
+            'output': list(myoutputs),
+            'residual': myresiduals
         }
 
-        # responses (if in options)
-        if 'record_responses' in recording_options:
-            myresponses = set()
-
-            if recording_options['record_responses']:
-                myresponses = {n for n in self._responses
-                               if n in abs2prom and check_path(abs2prom[n], incl, excl, True)}
-
-                if MPI:
-                    myresponses = [n for n in myresponses if rrank == rowned[n]]
-
-            filtered_vars_to_record['res'] = list(myresponses)
-
-        # inputs (if in options)
-        if 'record_inputs' in recording_options:
-            myinputs = set()
-
-            if recording_options['record_inputs']:
-                myinputs = {n for n in model._inputs if check_path(n, incl, excl)}
-
-                if MPI:
-                    # gather the variables from all ranks to rank 0
-                    all_vars = model.comm.gather(myinputs, root=0)
-                    if MPI.COMM_WORLD.rank == 0:
-                        myinputs = all_vars[-1]
-                        for d in all_vars[:-1]:
-                            myinputs.update(d)
-
-                    myinputs = [n for n in myinputs if rrank == rowned[n]]
-
-            filtered_vars_to_record['in'] = list(myinputs)
-
-        # system outputs
-        myoutputs = set()
-
-        if incl:
-            myoutputs = {n for n in model._outputs
-                         if n in abs2prom and check_path(abs2prom[n], incl, excl)}
-
-            if MPI:
-                # gather the variables from all ranks to rank 0
-                all_vars = model.comm.gather(myoutputs, root=0)
-                if MPI.COMM_WORLD.rank == 0:
-                    myoutputs = all_vars[-1]
-                    for d in all_vars[:-1]:
-                        myoutputs.update(d)
-
-            # de-duplicate
-            myoutputs = myoutputs.difference(all_desvars, all_objectives, all_constraints)
-
-            if MPI:
-                myoutputs = [n for n in myoutputs if rrank == rowned[n]]
-
-        filtered_vars_to_record['sys'] = list(myoutputs)
-
-        return filtered_vars_to_record
+        return vars2record
 
     def _setup_recording(self):
         """
@@ -445,12 +457,7 @@ class Driver(object):
 
         self._rec_mgr.startup(self)
 
-        # record the system metadata to the recorders attached to this Driver
-        if self.recording_options['record_model_metadata']:
-            for sub in self._problem.model.system_iter(recurse=True, include_self=True):
-                self._rec_mgr.record_metadata(sub)
-
-    def _get_voi_val(self, name, meta, remote_vois, driver_scaling=True, ignore_indices=False):
+    def _get_voi_val(self, name, meta, remote_vois, driver_scaling=True, rank=None):
         """
         Get the value of a variable of interest (objective, constraint, or design var).
 
@@ -469,99 +476,104 @@ class Driver(object):
             When True, return values that are scaled according to either the adder and scaler or
             the ref and ref0 values that were specified when add_design_var, add_objective, and
             add_constraint were called on the model. Default is True.
-        ignore_indices : bool
-            Set to True if the full array is desired, not just those indicated by indices.
+        rank : int or None
+            If not None, gather value to this rank only.
 
         Returns
         -------
         float or ndarray
             The value of the named variable of interest.
         """
-        model = self._problem.model
+        model = self._problem().model
         comm = model.comm
-        vec = model._outputs._views_flat
+        get = model._outputs._abs_get_val
+        distributed_vars = self._dist_driver_vars
         indices = meta['indices']
 
-        if name in remote_vois:
-            owner, size = remote_vois[name]
-            if owner == comm.rank:
-                if indices is None or ignore_indices:
-                    val = vec[name].copy()
-                else:
-                    val = vec[name][indices]
-            else:
-                if not (indices is None or ignore_indices):
-                    size = len(indices)
-                val = np.empty(size)
+        if meta.get('ivc_source') is not None:
+            src_name = meta['ivc_source']
+        else:
+            src_name = name
 
-            comm.Bcast(val, root=owner)
+        if MPI:
+            distributed = comm.size > 0 and src_name in distributed_vars
+        else:
+            distributed = False
+
+        if src_name in remote_vois:
+            owner, size = remote_vois[src_name]
+            # if var is distributed or only gathering to one rank
+            # TODO - support distributed var under a parallel group.
+            if owner is None or rank is not None:
+                val = model.get_val(src_name, get_remote=True, rank=rank, flat=True)
+                if indices is not None:
+                    val = val[indices]
+            else:
+                if owner == comm.rank:
+                    if indices is None:
+                        val = get(name).copy()
+                    else:
+                        val = get(name)[indices]
+                else:
+                    if indices is not None:
+                        size = len(indices)
+                    val = np.empty(size)
+
+                comm.Bcast(val, root=owner)
+
+        elif distributed:
+            local_val = model.get_val(src_name, flat=True)
+            local_indices, sizes, _ = distributed_vars[src_name]
+            if local_indices is not None:
+                local_val = local_val[local_indices]
+            offsets = np.zeros(sizes.size, dtype=INT_DTYPE)
+            offsets[1:] = np.cumsum(sizes[:-1])
+            val = np.zeros(np.sum(sizes))
+            comm.Allgatherv(local_val, [val, sizes, offsets, MPI.DOUBLE])
+
         else:
             if name in self._designvars_discrete:
-                val = model._discrete_outputs[name]
+                val = model._discrete_outputs[src_name]
 
                 # At present, only integers are supported by OpenMDAO drivers.
                 # We check the values here.
-                valid = True
                 msg = "Only integer scalars or ndarrays are supported as values for " + \
                       "discrete variables when used as a design variable. "
-                if np.isscalar(val) and not isinstance(val, int):
+                if np.isscalar(val) and not isinstance(val, (int, np.integer)):
                     msg += "A value of type '{}' was specified.".format(val.__class__.__name__)
-                    valid = False
-                elif isinstance(val, np.ndarray) and not np.issubdtype(val[0], int):
+                    raise ValueError(msg)
+                elif isinstance(val, np.ndarray) and not np.issubdtype(val[0], np.integer):
                     msg += "An array of type '{}' was specified.".format(val[0].__class__.__name__)
-                    valid = False
-
-                if valid is False:
                     raise ValueError(msg)
 
-            elif indices is None or ignore_indices:
-                val = vec[name].copy()
+            elif indices is None:
+                val = get(src_name).copy()
             else:
-                val = vec[name][indices]
+                val = get(src_name)[indices]
 
         if self._has_scaling and driver_scaling:
             # Scale design variable values
-            adder = meta['adder']
+            adder = meta['total_adder']
             if adder is not None:
                 val += adder
 
-            scaler = meta['scaler']
+            scaler = meta['total_scaler']
             if scaler is not None:
                 val *= scaler
 
         return val
 
-    def get_design_var_values(self, filter=None, driver_scaling=True, ignore_indices=False):
+    def get_design_var_values(self):
         """
         Return the design variable values.
-
-        This is called to gather the initial design variable state.
-
-        Parameters
-        ----------
-        filter : list
-            List of desvar names used by recorders.
-        driver_scaling : bool
-            When True, return values that are scaled according to either the adder and scaler or
-            the ref and ref0 values that were specified when add_design_var, add_objective, and
-            add_constraint were called on the model. Default is True.
-        ignore_indices : bool
-            Set to True if the full array is desired, not just those indicated by indices.
 
         Returns
         -------
         dict
            Dictionary containing values of each design variable.
         """
-        if filter:
-            dvs = filter
-        else:
-            # use all the designvars
-            dvs = self._designvars
-
-        return {n: self._get_voi_val(n, self._designvars[n], self._remote_dvs,
-                                     driver_scaling=driver_scaling,
-                                     ignore_indices=ignore_indices) for n in dvs}
+        return {n: self._get_voi_val(n, dv, self._remote_dvs)
+                for n, dv in self._designvars.items()}
 
     def set_design_var(self, name, value):
         """
@@ -574,56 +586,57 @@ class Driver(object):
         value : float or ndarray
             Value for the design variable.
         """
-        problem = self._problem
+        problem = self._problem()
+        meta = self._designvars[name]
 
-        if (name in self._remote_dvs and
-                problem.model._owning_rank[name] != problem.comm.rank):
+        src_name = meta['ivc_source']
+
+        # if the value is not local, don't set the value
+        if (src_name in self._remote_dvs and
+                problem.model._owning_rank[src_name] != problem.comm.rank):
             return
 
-        meta = self._designvars[name]
         indices = meta['indices']
         if indices is None:
-            indices = slice(None)
+            indices = _full_slice
 
         if name in self._designvars_discrete:
-            problem.model._discrete_outputs[name] = int(value)
 
-        else:
-            desvar = problem.model._outputs._views_flat[name]
-            desvar[indices] = value
+            # Note, drivers set values here and generally should know it is setting an integer.
+            # However, the DOEdriver may pull a non-integer value from its generator, so we
+            # convert it.
+            if isinstance(value, float):
+                value = int(value)
+            elif isinstance(value, np.ndarray):
+                if isinstance(problem.model._discrete_outputs[src_name], int):
+                    # Setting an integer value with a 1D array - don't want to convert to array.
+                    value = int(value)
+                else:
+                    value = value.astype(np.int)
+
+            problem.model._discrete_outputs[src_name] = value
+
+        elif problem.model._outputs._contains_abs(src_name):
+            desvar = problem.model._outputs._abs_get_val(src_name)
+            if src_name in self._dist_driver_vars:
+                loc_idxs, _, dist_idxs = self._dist_driver_vars[src_name]
+            else:
+                loc_idxs = indices
+                dist_idxs = _full_slice
+
+            desvar[loc_idxs] = np.atleast_1d(value)[dist_idxs]
 
             # Undo driver scaling when setting design var values into model.
             if self._has_scaling:
-                scaler = meta['scaler']
+                scaler = meta['total_scaler']
                 if scaler is not None:
-                    desvar[indices] *= 1.0 / scaler
+                    desvar[loc_idxs] *= 1.0 / scaler
 
-                adder = meta['adder']
+                adder = meta['total_adder']
                 if adder is not None:
-                    desvar[indices] -= adder
+                    desvar[loc_idxs] -= adder
 
-    def get_response_values(self, filter=None):
-        """
-        Return response values.
-
-        Parameters
-        ----------
-        filter : list
-            List of response names used by recorders.
-
-        Returns
-        -------
-        dict
-           Dictionary containing values of each response.
-        """
-        if filter:
-            resps = filter
-        else:
-            resps = self._responses
-
-        return {n: self._get_voi_val(n, self._responses[n], self._remote_objs) for n in resps}
-
-    def get_objective_values(self, driver_scaling=True, filter=None, ignore_indices=False):
+    def get_objective_values(self, driver_scaling=True):
         """
         Return objective values.
 
@@ -633,28 +646,17 @@ class Driver(object):
             When True, return values that are scaled according to either the adder and scaler or
             the ref and ref0 values that were specified when add_design_var, add_objective, and
             add_constraint were called on the model. Default is True.
-        filter : list
-            List of objective names used by recorders.
-        ignore_indices : bool
-            Set to True if the full array is desired, not just those indicated by indices.
 
         Returns
         -------
         dict
            Dictionary containing values of each objective.
         """
-        if filter:
-            objs = filter
-        else:
-            objs = self._objs
+        return {n: self._get_voi_val(n, obj, self._remote_objs,
+                                     driver_scaling=driver_scaling)
+                for n, obj in self._objs.items()}
 
-        return {n: self._get_voi_val(n, self._objs[n], self._remote_objs,
-                                     driver_scaling=driver_scaling,
-                                     ignore_indices=ignore_indices)
-                for n in objs}
-
-    def get_constraint_values(self, ctype='all', lintype='all', driver_scaling=True, filter=None,
-                              ignore_indices=False):
+    def get_constraint_values(self, ctype='all', lintype='all', driver_scaling=True):
         """
         Return constraint values.
 
@@ -670,25 +672,14 @@ class Driver(object):
             When True, return values that are scaled according to either the adder and scaler or
             the ref and ref0 values that were specified when add_design_var, add_objective, and
             add_constraint were called on the model. Default is True.
-        filter : list
-            List of constraint names used by recorders.
-        ignore_indices : bool
-            Set to True if the full array is desired, not just those indicated by indices.
 
         Returns
         -------
         dict
            Dictionary containing values of each constraint.
         """
-        if filter is not None:
-            cons = filter
-        else:
-            cons = self._cons
-
         con_dict = {}
-        for name in cons:
-            meta = self._cons[name]
-
+        for name, meta in self._cons.items():
             if lintype == 'linear' and not meta['linear']:
                 continue
 
@@ -702,8 +693,7 @@ class Driver(object):
                 continue
 
             con_dict[name] = self._get_voi_val(name, meta, self._remote_cons,
-                                               driver_scaling=driver_scaling,
-                                               ignore_indices=ignore_indices)
+                                               driver_scaling=driver_scaling)
 
         return con_dict
 
@@ -720,7 +710,7 @@ class Driver(object):
             The nonlinear response names in order.
         """
         order = list(self._objs)
-        order.extend(n for n, meta in iteritems(self._cons)
+        order.extend(n for n, meta in self._cons.items()
                      if not ('linear' in meta and meta['linear']))
         return order
 
@@ -743,8 +733,10 @@ class Driver(object):
         self._objs = objs = OrderedDict()
         self._cons = cons = OrderedDict()
 
-        self._responses = resps = model.get_responses(recurse=True)
-        for name, data in iteritems(resps):
+        model._setup_driver_units()
+
+        self._responses = resps = model.get_responses(recurse=True, use_prom_ivc=True)
+        for name, data in resps.items():
             if data['type'] == 'con':
                 cons[name] = data
             else:
@@ -753,8 +745,8 @@ class Driver(object):
         response_size = sum(resps[n]['size'] for n in self._get_ordered_nl_responses())
 
         # Gather up the information for design vars.
-        self._designvars = designvars = model.get_design_vars(recurse=True)
-        desvar_size = sum(data['size'] for data in itervalues(designvars))
+        self._designvars = designvars = model.get_design_vars(recurse=True, use_prom_ivc=True)
+        desvar_size = sum(data['size'] for data in designvars.values())
 
         return response_size, desvar_size
 
@@ -771,12 +763,17 @@ class Driver(object):
             Failure flag; True if failed to converge, False is successful.
         """
         with RecordingDebugging(self._get_name(), self.iter_count, self):
-            self._problem.model.run_solve_nonlinear()
+            self._problem().model.run_solve_nonlinear()
 
         self.iter_count += 1
         return False
 
-    def _compute_totals(self, of=None, wrt=None, return_format='flat_dict', global_names=True):
+    @property
+    def _recording_iter(self):
+        return self._problem()._metadata['recording_iter']
+
+    def _compute_totals(self, of=None, wrt=None, return_format='flat_dict', global_names=None,
+                        use_abs_names=True):
         """
         Compute derivatives of desired quantities with respect to desired inputs.
 
@@ -795,29 +792,36 @@ class Driver(object):
             returns them in a dictionary whose keys are tuples of form (of, wrt). For
             the scipy optimizer, 'array' is also supported.
         global_names : bool
-            Set to True when passing in global names to skip some translation steps.
+            Deprecated.  Use 'use_abs_names' instead.
+        use_abs_names : bool
+            Set to True when passing in absolute names to skip some translation steps.
 
         Returns
         -------
         derivs : object
             Derivatives in form requested by 'return_format'.
         """
-        problem = self._problem
+        problem = self._problem()
         total_jac = self._total_jac
         debug_print = 'totals' in self.options['debug_print'] and (not MPI or
-                                                                   MPI.COMM_WORLD.rank == 0)
+                                                                   problem.comm.rank == 0)
 
         if debug_print:
             header = 'Driver total derivatives for iteration: ' + str(self.iter_count)
             print(header)
             print(len(header) * '-' + '\n')
 
+        if global_names is not None:
+            warn_deprecation("'global_names' is deprecated in calls to _compute_totals. "
+                             "Use 'use_abs_names' instead.")
+            use_abs_names = global_names
+
         if problem.model._owns_approx_jac:
-            self._recording_iter.stack.append(('_compute_totals_approx', 0))
+            self._recording_iter.push(('_compute_totals_approx', 0))
 
             try:
                 if total_jac is None:
-                    total_jac = _TotalJacInfo(problem, of, wrt, global_names,
+                    total_jac = _TotalJacInfo(problem, of, wrt, use_abs_names,
                                               return_format, approx=True, debug_print=debug_print)
 
                     # Don't cache linear constraint jacobian
@@ -828,23 +832,23 @@ class Driver(object):
                 else:
                     totals = total_jac.compute_totals_approx()
             finally:
-                self._recording_iter.stack.pop()
+                self._recording_iter.pop()
 
         else:
             if total_jac is None:
-                total_jac = _TotalJacInfo(problem, of, wrt, global_names, return_format,
+                total_jac = _TotalJacInfo(problem, of, wrt, use_abs_names, return_format,
                                           debug_print=debug_print)
 
                 # don't cache linear constraint jacobian
                 if not total_jac.has_lin_cons:
                     self._total_jac = total_jac
 
-            self._recording_iter.stack.append(('_compute_totals', 0))
+            self._recording_iter.push(('_compute_totals', 0))
 
             try:
                 totals = total_jac.compute_totals()
             finally:
-                self._recording_iter.stack.pop()
+                self._recording_iter.pop()
 
         if self._rec_mgr._recorders and self.recording_options['record_derivatives']:
             metadata = create_local_meta(self._get_name())
@@ -856,104 +860,23 @@ class Driver(object):
         """
         Record an iteration of the current Driver.
         """
-        if not self._rec_mgr._recorders:
-            return
+        record_iteration(self, self._problem(), self._get_name())
 
-        # Get the data to record (collective calls that get across all ranks)
-        opts = self.recording_options
-        filt = self._filtered_vars_to_record
-
-        if opts['record_desvars']:
-            des_vars = self.get_design_var_values(driver_scaling=False, ignore_indices=True)
-        else:
-            des_vars = {}
-
-        if opts['record_objectives']:
-            obj_vars = self.get_objective_values(driver_scaling=False, ignore_indices=True)
-        else:
-            obj_vars = {}
-
-        if opts['record_constraints']:
-            con_vars = self.get_constraint_values(driver_scaling=False, ignore_indices=True)
-        else:
-            con_vars = {}
-
-        if opts['record_responses']:
-            # res_vars = self.get_response_values()  # not really working yet
-            res_vars = {}
-        else:
-            res_vars = {}
-
-        des_vars = {name: des_vars[name] for name in filt['des']}
-        obj_vars = {name: obj_vars[name] for name in filt['obj']}
-        con_vars = {name: con_vars[name] for name in filt['con']}
-        # res_vars = {name: res_vars[name] for name in filt['res']}
-
-        model = self._problem.model
-
-        names = model._outputs._names
-        views = model._outputs._views
-        sys_vars = {name: views[name] for name in names if name in filt['sys']}
-
-        if self.recording_options['record_inputs']:
-            names = model._inputs._names
-            views = model._inputs._views
-            in_vars = {name: views[name] for name in names if name in filt['in']}
-        else:
-            in_vars = {}
-
-        if MPI:
-            des_vars = self._gather_vars(model, des_vars)
-            res_vars = self._gather_vars(model, res_vars)
-            obj_vars = self._gather_vars(model, obj_vars)
-            con_vars = self._gather_vars(model, con_vars)
-            sys_vars = self._gather_vars(model, sys_vars)
-            in_vars = self._gather_vars(model, in_vars)
-
-        outs = {}
-        if not MPI or model.comm.rank == 0:
-            outs.update(des_vars)
-            outs.update(res_vars)
-            outs.update(obj_vars)
-            outs.update(con_vars)
-            outs.update(sys_vars)
-
-        data = {
-            'out': outs,
-            'in': in_vars
-        }
-
-        metadata = create_local_meta(self._get_name())
-
-        self._rec_mgr.record_iteration(self, data, metadata)
-
-    def _gather_vars(self, root, local_vars):
+    def _get_recorder_metadata(self, case_name):
         """
-        Gather and return only variables listed in `local_vars` from the `root` System.
+        Return metadata from the latest iteration for use in the recorder.
 
         Parameters
         ----------
-        root : <System>
-            the root System for the Problem
-        local_vars : dict
-            local variable names and values
+        case_name : str
+            Name of current case.
 
         Returns
         -------
-        dct : dict
-            variable names and values.
+        dict
+            Metadata dictionary for the recorder.
         """
-        # if trace:
-        #     debug("gathering vars for recording in %s" % root.pathname)
-        all_vars = root.comm.gather(local_vars, root=0)
-        # if trace:
-        #     debug("DONE gathering rec vars for %s" % root.pathname)
-
-        if root.comm.rank == 0:
-            dct = all_vars[-1]
-            for d in all_vars[:-1]:
-                dct.update(d)
-            return dct
+        return create_local_meta(case_name)
 
     def _get_name(self):
         """
@@ -966,43 +889,11 @@ class Driver(object):
         """
         return "Driver"
 
-    def set_total_jac_sparsity(self, sparsity):
-        """
-        Set the sparsity of sub-jacobians of the total jacobian.
-
-        Note: This currently will have no effect if you are not using the pyOptSparseDriver.
-
-        Parameters
-        ----------
-        sparsity : str or dict
-
-            ::
-
-                # Sparsity is a nested dictionary where the outer keys are response
-                # names, the inner keys are design variable names, and the value is a tuple of
-                # the form (row_list, col_list, shape).
-                {
-                    resp1: {
-                        dv1: (rows, cols, shape),  # for sub-jac d_resp1/d_dv1
-                        dv2: (rows, cols, shape),
-                          ...
-                    },
-                    resp2: {
-                        ...
-                    }
-                    ...
-                }
-        """
-        if self.supports['total_jac_sparsity']:
-            self._total_jac_sparsity = sparsity
-        else:
-            raise RuntimeError("Driver '%s' does not support setting of total jacobian sparsity." %
-                               self._get_name())
-
     def declare_coloring(self, num_full_jacs=coloring_mod._DEF_COMP_SPARSITY_ARGS['num_full_jacs'],
                          tol=coloring_mod._DEF_COMP_SPARSITY_ARGS['tol'],
                          orders=coloring_mod._DEF_COMP_SPARSITY_ARGS['orders'],
                          perturb_size=coloring_mod._DEF_COMP_SPARSITY_ARGS['perturb_size'],
+                         min_improve_pct=coloring_mod._DEF_COMP_SPARSITY_ARGS['min_improve_pct'],
                          show_summary=coloring_mod._DEF_COMP_SPARSITY_ARGS['show_summary'],
                          show_sparsity=coloring_mod._DEF_COMP_SPARSITY_ARGS['show_sparsity']):
         """
@@ -1018,6 +909,9 @@ class Driver(object):
             Number of orders above and below the tolerance to check during the tolerance sweep.
         perturb_size : float
             Size of input/output perturbation during generation of sparsity.
+        min_improve_pct : float
+            If coloring does not improve (decrease) the number of solves more than the given
+            percentage, coloring will not be used.
         show_summary : bool
             If True, display summary information after generating coloring.
         show_sparsity : bool
@@ -1027,7 +921,12 @@ class Driver(object):
         self._coloring_info['tol'] = tol
         self._coloring_info['orders'] = orders
         self._coloring_info['perturb_size'] = perturb_size
-        self._coloring_info['coloring'] = coloring_mod._DYN_COLORING
+        self._coloring_info['min_improve_pct'] = min_improve_pct
+        if self._coloring_info['static'] is None:
+            self._coloring_info['dynamic'] = True
+        else:
+            self._coloring_info['dynamic'] = False
+        self._coloring_info['coloring'] = None
         self._coloring_info['show_summary'] = show_summary
         self._coloring_info['show_sparsity'] = show_sparsity
 
@@ -1045,33 +944,27 @@ class Driver(object):
         if self.supports['simultaneous_derivatives']:
             if coloring_mod._force_dyn_coloring and coloring is coloring_mod._STD_COLORING_FNAME:
                 # force the generation of a dynamic coloring this time
-                coloring = coloring_mod._DYN_COLORING
-            self._coloring_info['coloring'] = coloring
+                self._coloring_info['dynamic'] = True
+                self._coloring_info['static'] = None
+            else:
+                self._coloring_info['static'] = coloring
+                self._coloring_info['dynamic'] = False
+
+            self._coloring_info['coloring'] = None
         else:
             raise RuntimeError("Driver '%s' does not support simultaneous derivatives." %
                                self._get_name())
 
-    def set_simul_deriv_color(self, coloring):
-        """
-        See use_fixed_coloring. This method is deprecated.
-
-        Parameters
-        ----------
-        coloring : str or Coloring
-            Information about simultaneous coloring for design vars and responses.  If a
-            string, then coloring is assumed to be the name of a file that contains the
-            coloring information in pickle format. Otherwise it must be a Coloring object.
-            See the docstring for Coloring for details.
-
-        """
-        warn_deprecation("set_simul_deriv_color is deprecated.  Use use_fixed_coloring instead.")
-        self.use_fixed_coloring(coloring)
-
-    def _setup_tot_jac_sparsity(self):
+    def _setup_tot_jac_sparsity(self, coloring=None):
         """
         Set up total jacobian subjac sparsity.
 
         Drivers that can use subjac sparsity should override this.
+
+        Parameters
+        ----------
+        coloring : Coloring or None
+            Current coloring.
         """
         pass
 
@@ -1087,23 +980,29 @@ class Driver(object):
             The pre-existing or loaded Coloring, or None
         """
         info = self._coloring_info
-        coloring = info['coloring']
+        static = info['static']
 
-        if isinstance(coloring, coloring_mod.Coloring):
+        if isinstance(static, coloring_mod.Coloring):
+            coloring = static
+            info['coloring'] = coloring
+        else:
+            coloring = info['coloring']
+
+        if coloring is not None:
             return coloring
 
-        if coloring is coloring_mod._STD_COLORING_FNAME or isinstance(coloring, string_types):
-            if coloring is coloring_mod._STD_COLORING_FNAME:
+        if static is coloring_mod._STD_COLORING_FNAME or isinstance(static, str):
+            if static is coloring_mod._STD_COLORING_FNAME:
                 fname = self._get_total_coloring_fname()
             else:
-                fname = coloring
+                fname = static
             print("loading total coloring from file %s" % fname)
             coloring = info['coloring'] = coloring_mod.Coloring.load(fname)
             info.update(coloring._meta)
             return coloring
 
     def _get_total_coloring_fname(self):
-        return os.path.join(self._problem.options['coloring_dir'], 'total_coloring.pkl')
+        return os.path.join(self._problem().options['coloring_dir'], 'total_coloring.pkl')
 
     def _setup_simul_coloring(self):
         """
@@ -1115,7 +1014,7 @@ class Driver(object):
         if not coloring_mod._use_total_sparsity:
             return
 
-        problem = self._problem
+        problem = self._problem()
         if not problem.model._use_derivatives:
             simple_warning("Derivatives are turned off.  Skipping simul deriv coloring.")
             return
@@ -1138,26 +1037,22 @@ class Driver(object):
         Optionally print some debugging information before the model runs.
         """
         debug_opt = self.options['debug_print']
+        rank = self._problem().comm.rank
         if not debug_opt or debug_opt == ['totals']:
             return
 
-        if not MPI or MPI.COMM_WORLD.rank == 0:
+        if not MPI or rank == 0:
             header = 'Driver debug print for iter coord: {}'.format(
                 self._recording_iter.get_formatted_iteration_coordinate())
             print(header)
             print(len(header) * '-')
 
         if 'desvars' in debug_opt:
-            desvar_vals = self.get_design_var_values(driver_scaling=False, ignore_indices=True)
-            if not MPI or MPI.COMM_WORLD.rank == 0:
+            model = self._problem().model
+            desvar_vals = {n: model.get_val(n, get_remote=True, rank=0) for n in self._designvars}
+            if not MPI or rank == 0:
                 print("Design Vars")
                 if desvar_vals:
-
-                    # Print desvars in non_flattened state.
-                    meta = self._problem.model._var_allprocs_abs2meta
-                    for name in desvar_vals:
-                        shape = meta[name]['shape']
-                        desvar_vals[name] = desvar_vals[name].reshape(shape)
                     pprint.pprint(desvar_vals)
                 else:
                     print("None")
@@ -1169,9 +1064,11 @@ class Driver(object):
         """
         Optionally print some debugging information after the model runs.
         """
+        rank = self._problem().comm.rank
+
         if 'nl_cons' in self.options['debug_print']:
             cons = self.get_constraint_values(lintype='nonlinear', driver_scaling=False)
-            if not MPI or MPI.COMM_WORLD.rank == 0:
+            if not MPI or rank == 0:
                 print("Nonlinear constraints")
                 if cons:
                     pprint.pprint(cons)
@@ -1181,7 +1078,7 @@ class Driver(object):
 
         if 'ln_cons' in self.options['debug_print']:
             cons = self.get_constraint_values(lintype='linear', driver_scaling=False)
-            if not MPI or MPI.COMM_WORLD.rank == 0:
+            if not MPI or rank == 0:
                 print("Linear constraints")
                 if cons:
                     pprint.pprint(cons)
@@ -1191,7 +1088,7 @@ class Driver(object):
 
         if 'objs' in self.options['debug_print']:
             objs = self.get_objective_values(driver_scaling=False)
-            if not MPI or MPI.COMM_WORLD.rank == 0:
+            if not MPI or rank == 0:
                 print("Objectives")
                 if objs:
                     pprint.pprint(objs)
@@ -1220,7 +1117,7 @@ class RecordingDebugging(Recording):
             self
         """
         super(RecordingDebugging, self).__enter__()
-        self.recording_requester._pre_run_model_debug_print()
+        self.recording_requester()._pre_run_model_debug_print()
         return self
 
     def __exit__(self, *args):
@@ -1232,5 +1129,65 @@ class RecordingDebugging(Recording):
         *args : array
             Solver recording requires extra args.
         """
-        self.recording_requester._post_run_model_debug_print()
+        self.recording_requester()._post_run_model_debug_print()
         super(RecordingDebugging, self).__exit__()
+
+
+def record_iteration(requester, prob, case_name):
+    """
+    Record an iteration of the current Problem or Driver.
+
+    Parameters
+    ----------
+    requester : Problem or Driver
+        The recording requester.
+    prob : Problem
+        The Problem.
+    case_name : str
+        The name of this case.
+    """
+    if not requester._rec_mgr._recorders:
+        return
+
+    # Get the data to record (collective calls that get across all ranks)
+    filt = requester._filtered_vars_to_record
+    model = prob.model
+
+    inputs, outputs, residuals = model.get_nonlinear_vectors()
+
+    parallel = requester._rec_mgr._check_parallel() if model.comm.size > 1 else False
+
+    discrete_inputs = model._discrete_inputs
+    discrete_outputs = model._discrete_outputs
+
+    data = {'input': {}, 'output': {}, 'residual': {}}
+    if requester.recording_options['record_inputs'] and (inputs._names or len(discrete_inputs) > 0):
+        data['input'] = model._retrieve_data_of_kind(filt, 'input', 'nonlinear', parallel)
+
+    if requester.recording_options['record_outputs'] and \
+            (outputs._names or len(discrete_outputs) > 0):
+        data['output'] = model._retrieve_data_of_kind(filt, 'output', 'nonlinear', parallel)
+
+    if requester.recording_options['record_residuals'] and residuals._names:
+        data['residual'] = model._retrieve_data_of_kind(filt, 'residual', 'nonlinear', parallel)
+
+    from openmdao.core.problem import Problem
+    if isinstance(requester, Problem):
+        if requester.recording_options['record_derivatives'] and \
+                prob.driver._designvars and prob.driver._responses:
+            totals = requester.compute_totals(return_format='flat_dict_structured_key')
+            data['totals'] = totals
+
+        # Record solver info
+        if requester.recording_options['record_abs_error'] or \
+                requester.recording_options['record_rel_error']:
+            norm = model._residuals.get_norm()
+        if requester.recording_options['record_abs_error']:
+            data['abs'] = norm
+        if requester.recording_options['record_rel_error']:
+            solver = model.nonlinear_solver
+            norm0 = solver._norm0 if solver._norm0 != 0.0 else 1.0  # runonce never sets _norm0
+            data['rel'] = norm / norm0
+
+    requester._rec_mgr.record_iteration(requester, data,
+                                        requester._get_recorder_metadata(case_name))

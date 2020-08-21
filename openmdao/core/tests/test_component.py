@@ -1,11 +1,6 @@
 """Component unittests."""
-from __future__ import division
-
 import numpy as np
 import unittest
-
-from six.moves import range
-from six import assertRaisesRegex
 
 from openmdao.api import Problem, ExplicitComponent, Group, IndepVarComp
 from openmdao.core.component import Component
@@ -13,7 +8,7 @@ from openmdao.test_suite.components.expl_comp_simple import TestExplCompSimple
 from openmdao.test_suite.components.expl_comp_array import TestExplCompArray
 from openmdao.test_suite.components.impl_comp_simple import TestImplCompSimple
 from openmdao.test_suite.components.impl_comp_array import TestImplCompArray
-from openmdao.utils.assert_utils import assert_rel_error
+from openmdao.utils.assert_utils import assert_near_equal
 
 
 class TestExplicitComponent(unittest.TestCase):
@@ -37,7 +32,7 @@ class TestExplicitComponent(unittest.TestCase):
         prob['length'] = 3.
         prob['width'] = 2.
         prob.run_model()
-        assert_rel_error(self, prob['area'], 6.)
+        assert_near_equal(prob['area'], 6.)
 
     def test___init___array(self):
         """Test an explicit component with array inputs/outputs."""
@@ -47,7 +42,7 @@ class TestExplicitComponent(unittest.TestCase):
         prob['lengths'] = 3.
         prob['widths'] = 2.
         prob.run_model()
-        assert_rel_error(self, prob['total_volume'], 24.)
+        assert_near_equal(prob['total_volume'], 24.)
 
     def test_error_handling(self):
         """Test error handling when adding inputs/outputs."""
@@ -55,31 +50,31 @@ class TestExplicitComponent(unittest.TestCase):
 
         msg = "Incompatible shape for '.*': Expected (.*) but got (.*)"
 
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             comp.add_output('arr', val=np.ones((2, 2)), shape=([2]))
 
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             comp.add_input('arr', val=np.ones((2, 2)), shape=([2]))
 
         msg = "Shape of indices does not match shape for '.*': Expected (.*) but got (.*)"
 
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             comp.add_input('arr', val=np.ones((2, 2)), src_indices=[0, 1])
 
         msg = ("The shape argument should be an int, tuple, or list "
                "but a '<(.*) 'numpy.ndarray'>' was given")
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('arr', shape=np.array([2.]))
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_input('arr', shape=np.array([2.]))
 
         msg = ("The shape argument should be an int, tuple, or list "
                "but a '<(.*) 'float'>' was given")
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('arr', shape=2.)
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_input('arr', shape=2.)
 
         # check that a numpy integer type is accepted for shape
@@ -90,49 +85,49 @@ class TestExplicitComponent(unittest.TestCase):
         msg = 'The val argument should be a float, list, tuple, ndarray or Iterable'
         val = Component
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_input('x', val=val)
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('x', val=val)
 
         msg = 'The src_indices argument should be an int, list, tuple, ndarray or Iterable'
         src = Component
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_input('x', val=np.ones((2, 2)), src_indices=src)
 
         msg = 'The units argument should be a str or None'
         units = Component
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_input('x', val=np.ones((2, 2)), units=units)
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('x', val=np.ones((2, 2)), units=units)
 
         msg = 'The ref argument should be a float, list, tuple, ndarray or Iterable'
         val = Component
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('x', val=5.0, ref=val)
 
         msg = 'The ref0 argument should be a float, list, tuple, ndarray or Iterable'
         val = Component
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('x', val=5.0, ref0=val)
 
         msg = 'The res_ref argument should be a float, list, tuple, ndarray or Iterable'
         val = Component
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('x', val=5.0, res_ref=val)
 
         msg = 'The res_units argument should be a str or None'
         units = Component
 
-        with assertRaisesRegex(self, TypeError, msg):
+        with self.assertRaisesRegex(TypeError, msg):
             comp.add_output('x', val=5.0, res_units=val)
 
     def test_invalid_name(self):
@@ -148,7 +143,8 @@ class TestExplicitComponent(unittest.TestCase):
         nostr_names = [3, None, object, object()]
         nostr_error = "ExplicitComponent: The name argument should be a string."
 
-        empty_error = "ExplicitComponent: The name argument should be a non-empty string."
+        empty_in_error = "ExplicitComponent: '' is not a valid input name."
+        empty_out_error = "ExplicitComponent: '' is not a valid output name."
 
         for func in add_input_methods:
             for name in invalid_names:
@@ -163,7 +159,7 @@ class TestExplicitComponent(unittest.TestCase):
 
             with self.assertRaises(NameError) as cm:
                 func('', val=5.0)
-            self.assertEqual(str(cm.exception), empty_error)
+            self.assertEqual(str(cm.exception), empty_in_error)
 
         for func in add_output_methods:
             for name in invalid_names:
@@ -178,7 +174,7 @@ class TestExplicitComponent(unittest.TestCase):
 
             with self.assertRaises(NameError) as cm:
                 func('', val=5.0)
-            self.assertEqual(str(cm.exception), empty_error)
+            self.assertEqual(str(cm.exception), empty_out_error)
 
 
         # Stuff we allow.
@@ -192,7 +188,7 @@ class TestExplicitComponent(unittest.TestCase):
         # This tests a bug where, if you run setup more than once on a derived component class,
         # the list of var names continually gets prepended with the component global path.
 
-        class NewBase(Component):
+        class NewBase(ExplicitComponent):
             def __init__(self, **kwargs):
                 super(NewBase, self).__init__(**kwargs)
 
@@ -233,7 +229,7 @@ class TestExplicitComponent(unittest.TestCase):
         model.connect('px.x', 'comp.x')
 
         msg = "Variable name 'x' already exists."
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             prob.setup()
 
         class Comp(ExplicitComponent):
@@ -250,7 +246,7 @@ class TestExplicitComponent(unittest.TestCase):
         model.connect('px.x', 'comp.x')
 
         msg = "Variable name 'y' already exists."
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             prob.setup()
 
         class Comp(ExplicitComponent):
@@ -267,7 +263,7 @@ class TestExplicitComponent(unittest.TestCase):
         model.connect('px.x', 'comp.x')
 
         msg = "Variable name 'x' already exists."
-        with assertRaisesRegex(self, ValueError, msg):
+        with self.assertRaisesRegex(ValueError, msg):
             prob.setup()
 
         # Make sure we can reconfigure.
@@ -302,7 +298,7 @@ class TestImplicitComponent(unittest.TestCase):
 
         prob['a'] = a
         prob.run_model()
-        assert_rel_error(self, prob['x'], x)
+        assert_near_equal(prob['x'], x)
 
     def test___init___array(self):
         """Test an implicit component with array inputs/outputs."""
@@ -311,7 +307,7 @@ class TestImplicitComponent(unittest.TestCase):
 
         prob['rhs'] = np.ones(2)
         prob.run_model()
-        assert_rel_error(self, prob['x'], np.ones(2))
+        assert_near_equal(prob['x'], np.ones(2))
 
 
 class TestRangePartials(unittest.TestCase):
@@ -359,8 +355,8 @@ class TestRangePartials(unittest.TestCase):
         prob.setup()
         prob.run_model()
 
-        assert_rel_error(self, prob['vSum'], np.array([2., 3., 4., 5.]), 0.00001)
-        assert_rel_error(self, prob['vProd'], np.array([0., 2., 4., 6.]), 0.00001)
+        assert_near_equal(prob['vSum'], np.array([2., 3., 4., 5.]), 0.00001)
+        assert_near_equal(prob['vProd'], np.array([0., 2., 4., 6.]), 0.00001)
 
 
 if __name__ == '__main__':

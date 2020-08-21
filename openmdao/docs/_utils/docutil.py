@@ -1,7 +1,6 @@
 """
 A collection of functions for modifying source code that is embeded into the Sphinx documentation.
 """
-from __future__ import print_function
 
 import sys
 import os
@@ -13,22 +12,20 @@ import subprocess
 import tempfile
 import unittest
 import traceback
+import ast
+
 from docutils import nodes
 
 from collections import namedtuple
 
-from six import StringIO
-from six.moves import range, zip, cStringIO as cStringIO
+from io import StringIO
 
 from sphinx.errors import SphinxError
 from sphinx.writers.html import HTMLTranslator
 from sphinx.writers.html5 import HTML5Translator
 from redbaron import RedBaron
 
-if sys.version_info[0] == 2:
-    import cgi as cgiesc
-else:
-    import html as cgiesc
+import html as cgiesc
 
 from openmdao.utils.general_utils import printoptions
 
@@ -223,6 +220,17 @@ def replace_asserts_with_prints(src):
             #
             assert_node.value[0].replace("print")
 
+    if 'assert_near_equal' in src:
+        assert_nodes = rb.findAll("NameNode", value='assert_near_equal')
+        for assert_node in assert_nodes:
+            assert_node = assert_node.parent
+            # If relative error tolerance is specified, there are 3 arguments
+            if len(assert_node.value[1]) == 3:
+                # remove the relative error tolerance
+                remove_redbaron_node(assert_node.value[1], -1)
+            remove_redbaron_node(assert_node.value[1], -1)  # remove the expected value
+            assert_node.value[0].replace("print")
+
     if 'assert_almost_equal' in src:
         assert_nodes = rb.findAll("NameNode", value='assert_almost_equal')
         for assert_node in assert_nodes:
@@ -267,10 +275,13 @@ def get_source_code(path):
         The imported module.
     class or None
         The class specified by path.
+    method or None
+        The class method specified by path.
     """
 
     indent = 0
-    cls = None
+    class_obj = None
+    method_obj = None
 
     if path.endswith('.py'):
         if not os.path.isfile(path):
@@ -293,8 +304,8 @@ def get_source_code(path):
                 module_path = '.'.join(parts[:-1])
                 module = importlib.import_module(module_path)
                 class_name = parts[-1]
-                cls = getattr(module, class_name)
-                source = inspect.getsource(cls)
+                class_obj = getattr(module, class_name)
+                source = inspect.getsource(class_obj)
                 indent = 1
 
             except ImportError:
@@ -304,12 +315,12 @@ def get_source_code(path):
                 module = importlib.import_module(module_path)
                 class_name = parts[-2]
                 method_name = parts[-1]
-                cls = getattr(module, class_name)
-                meth = getattr(cls, method_name)
-                source = inspect.getsource(meth)
+                class_obj = getattr(module, class_name)
+                method_obj = getattr(class_obj, method_name)
+                source = inspect.getsource(method_obj)
                 indent = 2
 
-    return remove_leading_trailing_whitespace_lines(source), indent, module, cls
+    return remove_leading_trailing_whitespace_lines(source), indent, module, class_obj, method_obj
 
 
 def remove_raise_skip_tests(src):
@@ -576,9 +587,59 @@ def extract_output_blocks(run_output):
     return output_blocks
 
 
+def strip_decorators(src):
+    """
+    Remove any decorators from the source code of the method or function.
+
+    Parameters
+    ----------
+    src : str
+        Source code
+
+    Returns
+    -------
+    str
+        Source code minus any decorators
+    """
+    class Parser(ast.NodeVisitor):
+        def __init__(self):
+            self.function_node = None
+
+        def visit_FunctionDef(self, node):
+            self.function_node = node
+
+        def get_function(self):
+            return self.function_node
+
+    tree = ast.parse(src)
+    parser = Parser()
+    parser.visit(tree)
+
+    # get node for the first function
+    function_node = parser.get_function()
+    if not function_node.decorator_list:  # no decorators so no changes needed
+        return src
+
+    # Unfortunately, the ast library, for a decorated function, returns the line
+    #   number for the first decorator when asking for the line number of the function
+    # So using the line number for the argument for of the function, which is always
+    #   correct. But we assume that the argument is on the same line as the function.
+    # We also assume there IS an argument. If not, we raise an error.
+    if function_node.args.args:
+        function_lineno = function_node.args.args[0].lineno
+    else:
+        raise RuntimeError("Cannot determine line number for decorated function without args")
+    lines = src.splitlines()
+
+    undecorated_src = '\n'.join(lines[function_lineno - 1:])
+
+    return undecorated_src
+
+
 def strip_header(src):
     """
-    Directly manipulating function text to strip header.
+    Directly manipulating function text to strip header, usually or maybe always just the
+    "def" lines for a method or function.
 
     This function assumes that the docstring and header, if any, have already been removed.
 
@@ -645,7 +706,7 @@ def sync_multi_output_blocks(run_output):
 
         for i, outp in enumerate(proc_output_blocks):
             for tag in outp:
-                if outp[tag].strip():
+                if str(outp[tag]).strip():
                     if tag in synced_blocks:
                         synced_blocks[tag] += "(rank %d) %s\n" % (i, outp[tag])
                     else:
@@ -697,7 +758,7 @@ def run_code(code_to_run, path, module=None, cls=None, shows_plot=False, imports
             env['OPENMDAO_CURRENT_MODULE'] = module.__name__
             env['OPENMDAO_CODE_TO_RUN'] = code_to_run
 
-            p = subprocess.Popen(['mpirun', '-n', str(N_PROCS), 'python', _sub_runner],
+            p = subprocess.Popen(['mpirun', '-n', str(N_PROCS), sys.executable, _sub_runner],
                                  env=env)
             p.wait()
 
@@ -715,7 +776,7 @@ def run_code(code_to_run, path, module=None, cls=None, shows_plot=False, imports
                 with os.fdopen(fd, 'w') as tmp:
                     tmp.write(code_to_run)
                 try:
-                    p = subprocess.Popen(['python', code_to_run_path],
+                    p = subprocess.Popen([sys.executable, code_to_run_path],
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=os.environ)
                     output, _ = p.communicate()
                     if p.returncode != 0:
@@ -729,7 +790,7 @@ def run_code(code_to_run, path, module=None, cls=None, shows_plot=False, imports
                 env['OPENMDAO_CURRENT_MODULE'] = module.__name__
                 env['OPENMDAO_CODE_TO_RUN'] = code_to_run
 
-                p = subprocess.Popen(['python', _sub_runner],
+                p = subprocess.Popen([sys.executable, _sub_runner],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
                 output, _ = p.communicate()
                 if p.returncode != 0:
@@ -742,7 +803,7 @@ def run_code(code_to_run, path, module=None, cls=None, shows_plot=False, imports
             # capture all output
             stdout = sys.stdout
             stderr = sys.stderr
-            strout = cStringIO()
+            strout = StringIO()
             sys.stdout = strout
             sys.stderr = strout
 

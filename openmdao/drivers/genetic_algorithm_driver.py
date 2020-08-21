@@ -23,9 +23,6 @@ John Wiley & Sons, Ltd.
 import os
 import copy
 
-from six import iteritems, itervalues, next
-from six.moves import range, zip
-
 import numpy as np
 from pyDOE2 import lhs
 
@@ -77,6 +74,7 @@ class SimpleGADriver(Driver):
         self.supports['linear_constraints'] = False
         self.supports['simultaneous_derivatives'] = False
         self.supports['active_set'] = False
+        self.supports._read_only = True
 
         self._desvar_idx = {}
         self._ga = None
@@ -103,6 +101,12 @@ class SimpleGADriver(Driver):
         self.options.declare('elitism', types=bool, default=True,
                              desc='If True, replace worst performing point with best from previous'
                              ' generation each iteration.')
+        self.options.declare('gray', types=bool, default=False,
+                             desc='If True, use Gray code for binary encoding. Gray coding makes'
+                             ' the binary representation of adjacent integers differ by one bit.')
+        self.options.declare('cross_bits', types=bool, default=False,
+                             desc='If True, crossover swaps single bits instead the default'
+                             ' k-point crossover.')
         self.options.declare('max_gen', default=100,
                              desc='Number of generations before termination.')
         self.options.declare('pop_size', default=0,
@@ -116,11 +120,10 @@ class SimpleGADriver(Driver):
                              desc='Penalty function parameter.')
         self.options.declare('penalty_exponent', default=1.,
                              desc='Penalty function exponent.')
-        self.options.declare('Pc', default=0.5, lower=0., upper=1.,
+        self.options.declare('Pc', default=0.1, lower=0., upper=1.,
                              desc='Crossover rate.')
-        self.options.declare('Pm',
-                             desc='Mutation rate.', default=None, lower=0., upper=1.,
-                             allow_none=True)
+        self.options.declare('Pm', default=0.01, lower=0., upper=1., allow_none=True,
+                             desc='Mutation rate.')
         self.options.declare('multi_obj_weights', default={}, types=(dict),
                              desc='Weights of objectives for multi-objective optimization.'
                              'Weights are specified as a dictionary with the absolute names'
@@ -128,6 +131,11 @@ class SimpleGADriver(Driver):
                              'if not given.')
         self.options.declare('multi_obj_exponent', default=1., lower=0.,
                              desc='Multi-objective weighting exponent.')
+        self.options.declare('compute_pareto', default=False, types=(bool, ),
+                             desc='When True, compute a set of non-dominated points based on all '
+                             'given objectives and update it each generation. The multi-objective '
+                             'weight and exponents are ignored because the algorithm uses all '
+                             'objective values instead of a composite.')
 
     def _setup_driver(self, problem):
         """
@@ -143,7 +151,7 @@ class SimpleGADriver(Driver):
         super(SimpleGADriver, self)._setup_driver(problem)
 
         model_mpi = None
-        comm = self._problem.comm
+        comm = problem.comm
         if self._concurrent_pop_size > 0:
             model_mpi = (self._concurrent_pop_size, self._concurrent_color)
         elif not self.options['run_parallel']:
@@ -168,7 +176,7 @@ class SimpleGADriver(Driver):
             The communicator for the Problem model.
         """
         procs_per_model = self.options['procs_per_model']
-        if MPI and self.options['run_parallel'] and procs_per_model > 1:
+        if MPI and self.options['run_parallel']:
 
             full_size = comm.size
             size = full_size // procs_per_model
@@ -211,24 +219,31 @@ class SimpleGADriver(Driver):
         boolean
             Failure flag; True if failed to converge, False is successful.
         """
-        model = self._problem.model
+        model = self._problem().model
         ga = self._ga
 
         ga.elite = self.options['elitism']
+        ga.gray_code = self.options['gray']
+        ga.cross_bits = self.options['cross_bits']
         pop_size = self.options['pop_size']
         max_gen = self.options['max_gen']
         user_bits = self.options['bits']
+        compute_pareto = self.options['compute_pareto']
+
         Pm = self.options['Pm']  # if None, it will be calculated in execute_ga()
         Pc = self.options['Pc']
 
         self._check_for_missing_objective()
+
+        if compute_pareto:
+            self._ga.nobj = len(self._objs)
 
         # Size design variables.
         desvars = self._designvars
         desvar_vals = self.get_design_var_values()
 
         count = 0
-        for name, meta in iteritems(desvars):
+        for name, meta in desvars.items():
             if name in self._designvars_discrete:
                 val = desvar_vals[name]
                 if np.isscalar(val):
@@ -247,7 +262,7 @@ class SimpleGADriver(Driver):
         x0 = np.empty(count)
 
         # Figure out bounds vectors and initial design vars
-        for name, meta in iteritems(desvars):
+        for name, meta in desvars.items():
             i, j = self._desvar_idx[name]
             lower_bound[i:j] = meta['lower']
             upper_bound[i:j] = meta['upper']
@@ -256,13 +271,13 @@ class SimpleGADriver(Driver):
         # Bits of resolution
         abs2prom = model._var_abs2prom['output']
 
-        for name, meta in iteritems(desvars):
+        for name, meta in desvars.items():
             i, j = self._desvar_idx[name]
 
-            if name in self._designvars_discrete:
-                prom_name = name
-            else:
+            if name in abs2prom:
                 prom_name = abs2prom[name]
+            else:
+                prom_name = name
 
             if name in user_bits:
                 val = user_bits[name]
@@ -292,18 +307,24 @@ class SimpleGADriver(Driver):
                                               bits, pop_size, max_gen,
                                               self._randomstate, Pm, Pc)
 
-        # Pull optimal parameters back into framework and re-run, so that
-        # framework is left in the right final state
-        for name in desvars:
-            i, j = self._desvar_idx[name]
-            val = desvar_new[i:j]
-            self.set_design_var(name, val)
+        if compute_pareto:
+            # Just save the non-dominated points.
+            self.desvar_nd = desvar_new
+            self.obj_nd = obj
 
-        with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
-            model.run_solve_nonlinear()
-            rec.abs = 0.0
-            rec.rel = 0.0
-        self.iter_count += 1
+        else:
+            # Pull optimal parameters back into framework and re-run, so that
+            # framework is left in the right final state
+            for name in desvars:
+                i, j = self._desvar_idx[name]
+                val = desvar_new[i:j]
+                self.set_design_var(name, val)
+
+            with RecordingDebugging(self._get_name(), self.iter_count, self) as rec:
+                model.run_solve_nonlinear()
+                rec.abs = 0.0
+                rec.rel = 0.0
+            self.iter_count += 1
 
         return False
 
@@ -377,14 +398,19 @@ class SimpleGADriver(Driver):
         int
             Case number, used for identification when run in parallel.
         """
-        model = self._problem.model
+        model = self._problem().model
         success = 1
 
         objs = self.get_objective_values()
         nr_objectives = len(objs)
 
-        # Single objective, if there is nly one objective, which has only one element
-        is_single_objective = (nr_objectives == 1) and (len(next(itervalues(objs))) == 1)
+        # Single objective, if there is only one objective, which has only one element
+        if nr_objectives > 1:
+            is_single_objective = False
+        else:
+            for obj in objs.items():
+                is_single_objective = len(obj) == 1
+                break
 
         obj_exponent = self.options['multi_obj_exponent']
         if self.options['multi_obj_weights']:  # not empty
@@ -392,7 +418,7 @@ class SimpleGADriver(Driver):
         else:
             # Same weight for all objectives, if not specified
             obj_weights = {name: 1. for name in objs.keys()}
-        sum_weights = sum(itervalues(obj_weights))
+        sum_weights = sum(obj_weights.values())
 
         for name in self._designvars:
             i, j = self._desvar_idx[name]
@@ -414,10 +440,15 @@ class SimpleGADriver(Driver):
 
             obj_values = self.get_objective_values()
             if is_single_objective:  # Single objective optimization
-                obj = next(itervalues(obj_values))  # First and only key in the dict
+                for i in obj_values.values():
+                    obj = i  # First and only key in the dict
+
+            elif self.options['compute_pareto']:
+                obj = np.array([val for val in obj_values.values()]).flatten()
+
             else:  # Multi-objective optimization with weighted sums
                 weighted_objectives = np.array([])
-                for name, val in iteritems(obj_values):
+                for name, val in obj_values.items():
                     # element-wise multiplication with scalar
                     # takes the average, if an objective is a vector
                     try:
@@ -438,16 +469,16 @@ class SimpleGADriver(Driver):
                 fun = obj
             else:
                 constraint_violations = np.array([])
-                for name, val in iteritems(self.get_constraint_values()):
+                for name, val in self.get_constraint_values().items():
                     con = self._cons[name]
                     # The not used fields will either None or a very large number
-                    if (con['lower'] is not None) and (con['lower'] > -almost_inf):
+                    if (con['lower'] is not None) and np.any(con['lower'] > -almost_inf):
                         diff = val - con['lower']
                         violation = np.array([0. if d >= 0 else abs(d) for d in diff])
-                    elif (con['upper'] is not None) and (con['upper'] < almost_inf):
+                    elif (con['upper'] is not None) and np.any(con['upper'] < almost_inf):
                         diff = val - con['upper']
                         violation = np.array([0. if d <= 0 else abs(d) for d in diff])
-                    elif (con['equals'] is not None) and (abs(con['equals']) < almost_inf):
+                    elif (con['equals'] is not None) and np.any(np.abs(con['equals']) < almost_inf):
                         diff = val - con['equals']
                         violation = np.absolute(diff)
                     constraint_violations = np.hstack((constraint_violations, violation))
@@ -477,12 +508,19 @@ class GeneticAlgorithm(object):
         The MPI communicator that will be used objective evaluation for each generation.
     elite : bool
         Elitism flag.
+    gray_code : bool
+        Gray code binary representation flag.
+    cross_bits : bool
+        Crossover swaps bits instead of tails flag. Swapping bits is similar to mutation,
+        so when used Pc should be increased and Pm reduced.
     lchrom : int
         Chromosome length.
     model_mpi : None or tuple
         If the model in objfun is also parallel, then this will contain a tuple with the the
         total number of population points to evaluate concurrently, and the color of the point
         to evaluate on this rank.
+    nobj : int
+        Number of objectives.
     npop : int
         Population size.
     objfun : function
@@ -509,7 +547,10 @@ class GeneticAlgorithm(object):
 
         self.lchrom = 0
         self.npop = 0
+        self.nobj = 1
         self.elite = True
+        self.gray_code = False
+        self.cross_bits = False
         self.model_mpi = model_mpi
 
     def execute_ga(self, x0, vlb, vub, vob, bits, pop_size, max_gen, random_state, Pm=None, Pc=0.5):
@@ -550,14 +591,28 @@ class GeneticAlgorithm(object):
             Number of successful function evaluations.
         """
         comm = self.comm
-        xopt = copy.deepcopy(vlb)
-        fopt = np.inf
+        nobj = self.nobj
         self.lchrom = int(np.sum(bits))
 
-        if np.mod(pop_size, 2) == 1:
-            pop_size += 1
+        if nobj > 1:
+            xopt = []
+            fopt = []
+
+            # Needs to be divisible by number of objectives because of tournament selection
+            # strategy.
+            if np.mod(pop_size, nobj) > 0:
+                pop_size += nobj - np.mod(pop_size, nobj)
+        else:
+            xopt = copy.deepcopy(vlb)
+            fopt = np.inf
+
+            # Needs to be divisible by two because tournament selection pits one half of the
+            # population against the other half.
+            if np.mod(pop_size, 2) == 1:
+                pop_size += 1
+
         self.npop = int(pop_size)
-        fitness = np.zeros((self.npop, ))
+        fitness = np.zeros((self.npop, nobj))
 
         # If mutation rate is not provided as input
         if Pm is None:
@@ -574,7 +629,7 @@ class GeneticAlgorithm(object):
             old_gen = copy.deepcopy(new_gen)
             x_pop = self.decode(old_gen, vlb, vub, bits)
 
-            # Evaluate points in this generation.
+            # Evaluate fitness of points in this generation.
             if comm is not None:
                 # Parallel
 
@@ -602,7 +657,7 @@ class GeneticAlgorithm(object):
                     if returns:
                         val, success, ii = returns
                         if success:
-                            fitness[ii] = val
+                            fitness[ii, :] = val
                             nfit += 1
 
                     else:
@@ -619,36 +674,91 @@ class GeneticAlgorithm(object):
                         # Exceeded bounds for integer variables that are over-allocated.
                         success = False
                     else:
-                        fitness[ii], success, _ = self.objfun(x, 0)
+                        fitness[ii, :], success, _ = self.objfun(x, 0)
 
                     if success:
                         nfit += 1
                     else:
-                        fitness[ii] = np.inf
+                        fitness[ii, :] = np.inf
 
-            # Elitism means replace worst performing point with best from previous generation.
-            if elite and generation > 0:
-                max_index = np.argmax(fitness)
-                old_gen[max_index] = min_gen
-                x_pop[max_index] = min_x
-                fitness[max_index] = min_fit
+            # Find Pareto front.
+            if nobj > 1:
+                xopt, fopt = self.eval_pareto(x_pop, fitness, xopt, fopt)
 
-            # Find best performing point in this generation.
-            min_fit = np.min(fitness)
-            min_index = np.argmin(fitness)
-            min_gen = old_gen[min_index]
-            min_x = x_pop[min_index]
+            # Find best objective.
+            else:
+                # Elitism means replace worst performing point with best from
+                # previous generation.
+                if elite and generation > 0:
+                    max_index = np.argmax(fitness[:, 0])
+                    old_gen[max_index] = min_gen
+                    x_pop[max_index] = min_x
+                    fitness[max_index, 0] = min_fit
 
-            if min_fit < fopt:
-                fopt = min_fit
-                xopt = min_x
+                # Find best performing point in this generation.
+                min_fit = np.min(fitness)
+                min_index = np.argmin(fitness)
+                min_gen = old_gen[min_index]
+                min_x = x_pop[min_index]
+
+                if min_fit < fopt:
+                    fopt = min_fit
+                    xopt = min_x
 
             # Evolve new generation.
-            new_gen = self.tournament(old_gen, fitness)
+
+            if nobj > 1:
+                new_gen, new_obj = self.tournament_multi_obj(old_gen, fitness)
+            else:
+                new_gen = self.tournament(old_gen, fitness[:, 0])
+
             new_gen = self.crossover(new_gen, Pc)
             new_gen = self.mutate(new_gen, Pm)
 
         return xopt, fopt, nfit
+
+    def eval_pareto(self, x, obj, x_nd, obj_nd):
+        """
+        Produce a set of non dominated designs.
+
+        Parameters
+        ----------
+        x : ndarray
+            Design points from new generation.
+        obj : ndarray
+            Objective values from new generation.
+        x_nd : ndarray
+            Non dominated design points from previous pareto evaluation.
+        obj_nd : ndarray
+            Non dominated objective values from previous pareto evaluation.
+
+        Returns
+        -------
+        ndarray
+            Nondominated design points.
+        ndarray
+            Objective at nondominated design points.
+        """
+        if len(x_nd) > 1:
+            ypop = np.concatenate((np.array(obj_nd), obj), axis=0)
+            xpop = np.concatenate((x_nd, x), axis=0)
+        else:
+            ypop = obj
+            xpop = x
+
+        n_pts = ypop.shape[0]
+        i = 0
+        pot_idx = np.arange(n_pts)
+        while i < len(ypop):
+            nd_point_mask = np.any(ypop < ypop[i, :], axis=1)
+            nd_point_mask[i] = True
+
+            # Remove dominated points
+            pot_idx = pot_idx[nd_point_mask]
+            ypop = ypop[nd_point_mask]
+            i = np.sum(nd_point_mask[:i]) + 1
+
+        return xpop[pot_idx, :], ypop
 
     def tournament(self, old_gen, fitness):
         """
@@ -658,7 +768,6 @@ class GeneticAlgorithm(object):
         ----------
         old_gen : ndarray
             Points in current generation
-
         fitness : ndarray
             Objective value of each point.
 
@@ -680,11 +789,52 @@ class GeneticAlgorithm(object):
 
         return np.concatenate(np.array(new_gen), axis=1).reshape(old_gen.shape)
 
+    def tournament_multi_obj(self, old_gen, obj_val):
+        """
+        Apply tournament selection and keep the best points.
+
+        This method is used if there are multiple objectives and the non-dominated set is being
+        kept.
+
+        Parameters
+        ----------
+        old_gen : ndarray
+            Points in current generation
+        obj_val : ndarray
+            Objective value of each point.
+
+        Returns
+        -------
+        ndarray
+            New generation with best points.
+        ndarray
+            Corresponding objective values.
+        """
+        nobj = self.nobj
+        npop = self.npop
+        nrow = npop // nobj
+        new_gen = []
+        new_obj = []
+
+        idx = np.array(range(0, npop - 1, nobj))
+        for j in np.arange(nobj):
+            old_gen, i_shuffled = self.shuffle(old_gen)
+            obj_val = obj_val[i_shuffled]
+
+            # Each point competes with its neighbor; save the best.
+            i_min = np.argmin(obj_val[:, j].reshape((nrow, nobj)), axis=1)
+            selected = i_min + idx
+            new_gen.append(old_gen[selected])
+            new_obj.append(obj_val[selected])
+
+        return np.concatenate(np.array(new_gen), axis=1).reshape(old_gen.shape), \
+            np.concatenate(np.array(new_obj), axis=1).reshape(obj_val.shape)
+
     def crossover(self, old_gen, Pc):
         """
         Apply crossover to the current generation.
 
-        Crossover flips two adjacent genes.
+        Crossover swaps tails (k-point crossover) of two adjacent genes.
 
         Parameters
         ----------
@@ -706,8 +856,12 @@ class GeneticAlgorithm(object):
         for ii, jj in zip(idx, idy):
             i = 2 * ii
             j = i + 1
-            new_gen[i][jj] = old_gen[j][jj]
-            new_gen[j][jj] = old_gen[i][jj]
+            if self.cross_bits:  # swap single bit
+                new_gen[i][jj] = old_gen[j][jj]
+                new_gen[j][jj] = old_gen[i][jj]
+            else:               # swap remainder
+                new_gen[i][jj:] = old_gen[j][jj:]
+                new_gen[j][jj:] = old_gen[i][jj:]
         return new_gen
 
     def mutate(self, current_gen, Pm):
@@ -768,7 +922,7 @@ class GeneticAlgorithm(object):
             Lower bound array.
         vub : ndarray
             Upper bound array.
-        bits : ndarray
+        bits : ndarray(dtype=np.int)
             Number of bits for decoding.
 
         Returns
@@ -776,6 +930,10 @@ class GeneticAlgorithm(object):
         ndarray
             Decoded design variable values.
         """
+        pts = gen.copy()
+        if self.gray_code:
+            for i in range(np.shape(gen)[0]):
+                pts[i] = self.from_gray(gen[i])
         num_desvar = len(bits)
         interval = (vub - vlb) / (2**bits - 1)
         x = np.empty((self.npop, num_desvar))
@@ -784,7 +942,7 @@ class GeneticAlgorithm(object):
         for jj in range(num_desvar):
             exponents = 2**np.array(range(bits[jj] - 1, -1, -1))
             ebit += bits[jj]
-            fact = exponents * (gen[:, sbit:ebit])
+            fact = exponents * (pts[:, sbit:ebit])
             x[:, jj] = np.einsum('ij->i', fact) * interval[jj] + vlb[jj]
             sbit = ebit
         return x
@@ -792,6 +950,8 @@ class GeneticAlgorithm(object):
     def encode(self, x, vlb, vub, bits):
         """
         Encode array of real values to array of binary arrays.
+
+        The array of arrays represents a single population member.
 
         Parameters
         ----------
@@ -801,17 +961,64 @@ class GeneticAlgorithm(object):
             Lower bound array.
         vub : ndarray
             Upper bound array.
-        bits : int
+        bits : ndarray(dtype=np.int)
             Number of bits for decoding.
 
         Returns
         -------
         ndarray
-            Population of points, encoded.
+            Single population member, encoded.
         """
         interval = (vub - vlb) / (2**bits - 1)
         x = np.maximum(x, vlb)
         x = np.minimum(x, vub)
         x = np.round((x - vlb) / interval).astype(np.int)
         byte_str = [("0" * b + bin(i)[2:])[-b:] for i, b in zip(x, bits)]
-        return np.array([int(c) for s in byte_str for c in s])
+        result = np.array([int(c) for s in byte_str for c in s])
+        if self.gray_code:
+            result = self.to_gray(result)
+        return result
+
+    @staticmethod
+    def to_gray(g):
+        """
+        Convert a binary array representing a single population member to Gray code.
+
+        Parameters
+        ----------
+        g : binary array
+             Normal binary array, e.g. np.array([0, 0, 1, 0]).
+
+        Returns
+        -------
+        ndarray
+            Binary array using Gray code, e.g. np.array([0, 0, 1, 1]).
+        """
+        s = ''.join([str(x) for x in g])                     # convert to binary string: '0010'
+        i = int(s, 2)                                        # convert to Integer: 2
+        gi = i ^ (i >> 1)                                    # compute gray code Integer: 3
+        gs = np.binary_repr(gi, len(g))                      # convert to binary string: '0011'
+        return np.array([0 if q == '0' else 1 for q in gs])  # convert to np.array: [0, 0, 1, 1]
+
+    @staticmethod
+    def from_gray(g):
+        """
+        Convert a Gray coded binary array to normal binary coding.
+
+        The input and output arrays represent a single population member.
+
+        Parameters
+        ----------
+        g : binary array
+            Gray coded binary array, e.g. np.array([0, 0, 1, 1]).
+
+        Returns
+        -------
+        ndarray
+            Binary array using normal coding, e.g. np.array([0, 0, 1, 0]).
+        """
+        b = g.copy()
+        for i in range(1, len(g)):
+            prev = 1 if b[i - 1] == 0 else 0
+            b[i] = b[i - 1] if g[i] == 0 else prev
+        return b

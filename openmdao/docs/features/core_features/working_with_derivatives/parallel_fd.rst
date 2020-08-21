@@ -1,13 +1,13 @@
 .. _feature_parallel_fd:
 
 ************************************************************************************************
-Speeding up Derivative Approximations with Parallel Finite Difference and Parrallel Complex Step
+Speeding up Derivative Approximations with Parallel Finite Difference and Parallel Complex Step
 ************************************************************************************************
 
 If you have multiple processors available to you, it's possible to speed up the calculation of
 approximated partials or totals by computing multiple columns of the approximated Jacobian matrix
 simultaneously across multiple processes.  Setting up *parallel* finite difference or *parallel*
-complex step is identical to setting up for serial execution, except for the additon of a single
+complex step is identical to setting up for serial execution, except for the addition of a single
 __init__ arg that sets *num_par_fd* on the System(s) where you want to compute the approximate
 derivatives. The *num_par_fd* arg specifies the number of approximated jacobian columns that will be
 computed in parallel, assuming that enough processes are provided when the problem script is
@@ -66,8 +66,8 @@ of our 3 processes should compute 2 columns of the partial jacobian.
   :layout: interleave
 
 
-Next, let's compute the total derivatives of our MatMulComp outputs with respect to our
-IndepVarComp output.  Again, we'll be using a *num_par_fd* value of 3 and a matrix having
+Next, let's compute the total derivatives of our MatMulComp outputs with respect to its input.
+Again, we'll be using a *num_par_fd* value of 3 and a matrix having
 6 columns, so each process should compute 2 columns of the total jacobian.  This time, however,
 we set the *num_par_fd* on our model instead of on our MatMultComp.
 

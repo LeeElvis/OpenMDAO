@@ -1,6 +1,4 @@
 """ Test the ExternalCodeComp. """
-from __future__ import print_function
-
 import os
 import sys
 import shutil
@@ -12,7 +10,7 @@ from scipy.optimize import fsolve
 import openmdao.api as om
 from openmdao.components.external_code_comp import STDOUT
 
-from openmdao.utils.assert_utils import assert_rel_error, assert_warning
+from openmdao.utils.assert_utils import assert_near_equal, assert_warning
 
 DIRECTORY = os.path.dirname((os.path.abspath(__file__)))
 
@@ -65,7 +63,7 @@ class TestExternalCodeComp(unittest.TestCase):
 
     def test_normal(self):
         self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out'
+            sys.executable, 'extcode_example.py', 'extcode.out'
         ]
 
         self.extcode.options['external_input_files'] = ['extcode_example.py']
@@ -108,7 +106,7 @@ class TestExternalCodeComp(unittest.TestCase):
 
     def test_timeout_raise(self):
         self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out', '--delay', '3'
+            sys.executable, 'extcode_example.py', 'extcode.out', '--delay', '3'
         ]
         self.extcode.options['timeout'] = 1.0
 
@@ -124,7 +122,7 @@ class TestExternalCodeComp(unittest.TestCase):
 
     def test_error_code_raise(self):
         self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out', '--delay', '-3'
+            sys.executable, 'extcode_example.py', 'extcode.out', '--delay', '-3'
         ]
         self.extcode.options['timeout'] = 1.0
 
@@ -142,7 +140,7 @@ class TestExternalCodeComp(unittest.TestCase):
 
     def test_error_code_soft(self):
         self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out', '--delay', '-3'
+            sys.executable, 'extcode_example.py', 'extcode.out', '--delay', '-3'
         ]
         self.extcode.options['timeout'] = 1.0
         self.extcode.options['fail_hard'] = False
@@ -163,7 +161,7 @@ class TestExternalCodeComp(unittest.TestCase):
     def test_allowed_return_code(self):
         self.extcode.options['allowed_return_codes'] = set(range(5))
         self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out', '--return_code', '4'
+            sys.executable, 'extcode_example.py', 'extcode.out', '--return_code', '4'
         ]
 
         self.extcode.options['external_input_files'] = ['extcode_example.py']
@@ -174,7 +172,7 @@ class TestExternalCodeComp(unittest.TestCase):
     def test_disallowed_return_code(self):
         self.extcode.options['allowed_return_codes'] = list(range(5))
         self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out', '--return_code', '7'
+            sys.executable, 'extcode_example.py', 'extcode.out', '--return_code', '7'
         ]
 
         self.extcode.options['external_input_files'] = ['extcode_example.py']
@@ -220,7 +218,7 @@ class TestExternalCodeComp(unittest.TestCase):
     def test_env_vars(self):
         self.extcode.options['env_vars'] = {'TEST_ENV_VAR': 'SOME_ENV_VAR_VALUE'}
         self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out', '--write_test_env_var'
+            sys.executable, 'extcode_example.py', 'extcode.out', '--write_test_env_var'
         ]
 
         self.prob.setup(check=True)
@@ -273,9 +271,12 @@ class ParaboloidExternalCodeComp(om.ExternalCodeComp):
         self.options['external_input_files'] = [self.input_file]
         self.options['external_output_files'] = [self.output_file]
 
-        self.options['command'] = [
-            'python', 'extcode_paraboloid.py', self.input_file, self.output_file
-        ]
+        # If you want to write your command as a list, the code below will also work.
+        # self.options['command'] = [
+        #     sys.executable, 'extcode_paraboloid.py', self.input_file, self.output_file
+        # ]
+
+        self.options['command'] = ('python extcode_paraboloid.py {} {}').format(self.input_file, self.output_file)
 
     def compute(self, inputs, outputs):
         x = inputs['x']
@@ -311,7 +312,7 @@ class ParaboloidExternalCodeCompFD(om.ExternalCodeComp):
         self.options['external_output_files'] = [self.output_file]
 
         self.options['command'] = [
-            'python', 'extcode_paraboloid.py', self.input_file, self.output_file
+            sys.executable, 'extcode_paraboloid.py', self.input_file, self.output_file
         ]
 
         # this external code does not provide derivatives, use finite difference
@@ -352,7 +353,7 @@ class ParaboloidExternalCodeCompDerivs(om.ExternalCodeComp):
         self.options['external_output_files'] = [self.output_file, self.derivs_file]
 
         self.options['command'] = [
-            'python', 'extcode_paraboloid_derivs.py',
+            sys.executable, 'extcode_paraboloid_derivs.py',
             self.input_file, self.output_file, self.derivs_file
         ]
 
@@ -425,20 +426,19 @@ class TestExternalCodeCompFeature(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        # create and connect inputs
-        model.add_subsystem('p1', om.IndepVarComp('x', 3.0))
-        model.add_subsystem('p2', om.IndepVarComp('y', -4.0))
-        model.add_subsystem('p', ParaboloidExternalCodeComp())
-
-        model.connect('p1.x', 'p.x')
-        model.connect('p2.y', 'p.y')
+        model.add_subsystem('p', ParaboloidExternalCodeComp(), promotes_inputs=['x', 'y'])
 
         # run the ExternalCodeComp Component
         prob.setup()
+
+        # Set input values
+        prob.set_val('p.x', 3.0)
+        prob.set_val('p.y', -4.0)
+
         prob.run_model()
 
         # print the output
-        self.assertEqual(prob['p.f_xy'], -15.0)
+        self.assertEqual(prob.get_val('p.f_xy'), -15.0)
 
     def test_optimize_fd(self):
         import openmdao.api as om
@@ -447,21 +447,15 @@ class TestExternalCodeCompFeature(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        # create and connect inputs
-        model.add_subsystem('p1', om.IndepVarComp('x', 3.0))
-        model.add_subsystem('p2', om.IndepVarComp('y', -4.0))
         model.add_subsystem('p', ParaboloidExternalCodeCompFD())
-
-        model.connect('p1.x', 'p.x')
-        model.connect('p2.y', 'p.y')
 
         # find optimal solution with SciPy optimize
         # solution (minimum): x = 6.6667; y = -7.3333
         prob.driver = om.ScipyOptimizeDriver()
         prob.driver.options['optimizer'] = 'SLSQP'
 
-        prob.model.add_design_var('p1.x', lower=-50, upper=50)
-        prob.model.add_design_var('p2.y', lower=-50, upper=50)
+        prob.model.add_design_var('p.x', lower=-50, upper=50)
+        prob.model.add_design_var('p.y', lower=-50, upper=50)
 
         prob.model.add_objective('p.f_xy')
 
@@ -469,10 +463,15 @@ class TestExternalCodeCompFeature(unittest.TestCase):
         prob.driver.options['disp'] = True
 
         prob.setup()
+
+        # Set input values
+        prob.set_val('p.x', 3.0)
+        prob.set_val('p.y', -4.0)
+
         prob.run_driver()
 
-        assert_rel_error(self, prob['p1.x'], 6.66666667, 1e-6)
-        assert_rel_error(self, prob['p2.y'], -7.3333333, 1e-6)
+        assert_near_equal(prob.get_val('p.x'), 6.66666667, 1e-6)
+        assert_near_equal(prob.get_val('p.y'), -7.3333333, 1e-6)
 
     def test_optimize_derivs(self):
         import openmdao.api as om
@@ -481,21 +480,15 @@ class TestExternalCodeCompFeature(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        # create and connect inputs
-        model.add_subsystem('p1', om.IndepVarComp('x', 3.0))
-        model.add_subsystem('p2', om.IndepVarComp('y', -4.0))
         model.add_subsystem('p', ParaboloidExternalCodeCompDerivs())
-
-        model.connect('p1.x', 'p.x')
-        model.connect('p2.y', 'p.y')
 
         # find optimal solution with SciPy optimize
         # solution (minimum): x = 6.6667; y = -7.3333
         prob.driver = om.ScipyOptimizeDriver()
         prob.driver.options['optimizer'] = 'SLSQP'
 
-        prob.model.add_design_var('p1.x', lower=-50, upper=50)
-        prob.model.add_design_var('p2.y', lower=-50, upper=50)
+        prob.model.add_design_var('p.x', lower=-50, upper=50)
+        prob.model.add_design_var('p.y', lower=-50, upper=50)
 
         prob.model.add_objective('p.f_xy')
 
@@ -503,59 +496,15 @@ class TestExternalCodeCompFeature(unittest.TestCase):
         prob.driver.options['disp'] = True
 
         prob.setup()
+
+        # Set input values
+        prob.set_val('p.x', 3.0)
+        prob.set_val('p.y', -4.0)
+
         prob.run_driver()
 
-        assert_rel_error(self, prob['p1.x'], 6.66666667, 1e-6)
-        assert_rel_error(self, prob['p2.y'], -7.3333333, 1e-6)
-
-
-# ------------------------------------------------------
-# run same test as above, only with the deprecated component,
-# to ensure we get the warning and the correct answer.
-# self-contained, to be removed when class name goes away.
-from openmdao.api import ExternalCode
-
-
-class DeprecatedExternalCodeForTesting(ExternalCode):
-    def __init__(self):
-        super(DeprecatedExternalCodeForTesting, self).__init__()
-
-
-class TestDeprecatedExternalCode(unittest.TestCase):
-
-    def setUp(self):
-        self.startdir = os.getcwd()
-        self.tempdir = tempfile.mkdtemp(prefix='test_extcode-')
-        os.chdir(self.tempdir)
-        shutil.copy(os.path.join(DIRECTORY, 'extcode_example.py'),
-                    os.path.join(self.tempdir, 'extcode_example.py'))
-
-        msg = "'ExternalCode' has been deprecated. Use 'ExternalCodeComp' instead."
-
-        with assert_warning(DeprecationWarning, msg):
-            self.extcode = DeprecatedExternalCodeForTesting()
-
-        self.prob = om.Problem()
-
-        self.prob.model.add_subsystem('extcode', self.extcode)
-
-    def tearDown(self):
-        os.chdir(self.startdir)
-        try:
-            shutil.rmtree(self.tempdir)
-        except OSError:
-            pass
-
-    def test_normal(self):
-        self.extcode.options['command'] = [
-            'python', 'extcode_example.py', 'extcode.out'
-        ]
-
-        self.extcode.options['external_input_files'] = ['extcode_example.py']
-        self.extcode.options['external_output_files'] = ['extcode.out']
-
-        self.prob.setup(check=True)
-        self.prob.run_model()
+        assert_near_equal(prob.get_val('p.x'), 6.66666667, 1e-6)
+        assert_near_equal(prob.get_val('p.y'), -7.3333333, 1e-6)
 
 
 class TestExternalCodeImplicitCompFeature(unittest.TestCase):
@@ -589,6 +538,7 @@ class TestExternalCodeImplicitCompFeature(unittest.TestCase):
             pass
 
     def test_simple_external_code_implicit_comp(self):
+        import sys
         import openmdao.api as om
 
         class MachExternalCodeComp(om.ExternalCodeImplicitComp):
@@ -609,12 +559,16 @@ class TestExternalCodeImplicitCompFeature(unittest.TestCase):
                 self.options['external_input_files'] = [self.input_file]
                 self.options['external_output_files'] = [self.output_file]
 
+
                 self.options['command_apply'] = [
-                    'python', 'extcode_mach.py', self.input_file, self.output_file,
+                    sys.executable, 'extcode_mach.py', self.input_file, self.output_file,
                 ]
                 self.options['command_solve'] = [
-                    'python', 'extcode_mach.py', self.input_file, self.output_file,
+                    sys.executable, 'extcode_mach.py', self.input_file, self.output_file,
                 ]
+
+                # If you want to write your own string command, the code below will also work.
+                # self.options['command_apply'] = ('python extcode_mach.py {} {}').format(self.input_file, self.output_file)
 
             def apply_nonlinear(self, inputs, outputs, residuals):
                 with open(self.input_file, 'w') as input_file:
@@ -644,7 +598,6 @@ class TestExternalCodeImplicitCompFeature(unittest.TestCase):
                 outputs['mach'] = mach
 
         group = om.Group()
-        group.add_subsystem('ar', om.IndepVarComp('area_ratio', 0.5))
         mach_comp = group.add_subsystem('comp', MachExternalCodeComp(), promotes=['*'])
         prob = om.Problem(model=group)
         group.nonlinear_solver = om.NewtonSolver()
@@ -657,18 +610,17 @@ class TestExternalCodeImplicitCompFeature(unittest.TestCase):
 
         area_ratio = 1.3
         super_sonic = False
-        prob['area_ratio'] = area_ratio
+        prob.set_val('area_ratio', area_ratio)
         mach_comp.options['super_sonic'] = super_sonic
         prob.run_model()
-        assert_rel_error(self, prob['mach'], mach_solve(area_ratio, super_sonic=super_sonic), 1e-8)
+        assert_near_equal(prob.get_val('mach'), mach_solve(area_ratio, super_sonic=super_sonic), 1e-8)
 
         area_ratio = 1.3
         super_sonic = True
-        prob['area_ratio'] = area_ratio
+        prob.set_val('area_ratio', area_ratio)
         mach_comp.options['super_sonic'] = super_sonic
         prob.run_model()
-        assert_rel_error(self, prob['mach'], mach_solve(area_ratio, super_sonic=super_sonic), 1e-8)
-
+        assert_near_equal(prob.get_val('mach'), mach_solve(area_ratio, super_sonic=super_sonic), 1e-8)
 
 if __name__ == "__main__":
     unittest.main()

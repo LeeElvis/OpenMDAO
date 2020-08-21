@@ -15,6 +15,9 @@ class SubSellar(om.Group):
                            promotes=['x', 'z', 'y1', 'y2'])
         self.add_subsystem('d2', SellarDis2withDerivatives(units=units, scaling=scaling),
                            promotes=['z', 'y1', 'y2'])
+        if units:
+             # auto_ivc update requires this since two 'z' inputs have different units
+            self.set_input_defaults('z', units='ft')
 
 
 class DoubleSellar(om.Group):
@@ -29,7 +32,7 @@ class DoubleSellar(om.Group):
         self.connect('g2.y2', 'g1.x')
 
         # Converge the outer loop with Gauss Seidel, with a looser tolerance.
-        self.nonlinear_solver = om.NewtonSolver()
+        self.nonlinear_solver = om.NewtonSolver(solve_subsystems=False)
         self.linear_solver = om.DirectSolver()
 
 
@@ -56,5 +59,5 @@ class DoubleSellarImplicit(om.Group):
         self.connect('g2.y2', 'g1.x')
 
         # Converge the outer loop with Gauss Seidel, with a looser tolerance.
-        self.nonlinear_solver = om.NewtonSolver()
+        self.nonlinear_solver = om.NewtonSolver(solve_subsystems=False)
         self.linear_solver = om.DirectSolver()

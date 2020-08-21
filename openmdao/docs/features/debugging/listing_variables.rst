@@ -19,7 +19,7 @@ Example
 -------
 
 In the following example, we create a model consisting of two instances of
-:code:`ImplicitComponent` and an :code:`IndepVarComp`.
+:code:`ImplicitComponent`.
 
 The implicit components are both instances of :code:`QuadraticComp`, defined
 as shown here.
@@ -29,8 +29,7 @@ as shown here.
 
 
 
-These two components are placed in a :code:`Group` with inputs provided by
-the :code:`IndepVarComp`.
+These two components are placed in a :code:`Group` with their common inputs promoted together.
 
 .. embed-code::
     openmdao.core.tests.test_impl_comp.ListFeatureTestCase.setUp
@@ -95,6 +94,10 @@ to :code:`None` and then access the data instead via the return value.
     :layout: interleave
 
 
+The :code:`System.get_io_metadata` method, which is used internally by :code:`list_inputs` and
+:code:`list_outputs`, returns the specified variable information as a dict.
+
+
 *List Names Only*
 ~~~~~~~~~~~~~~~~~
 
@@ -117,6 +120,53 @@ you can enable the display of promoted names by setting the optional argument,
     openmdao.core.tests.test_impl_comp.ListFeatureTestCase.test_list_prom_names
     :layout: interleave
 
+*List Variables Filtered by Name*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+You can use the :code:`includes` and :code:`excludes` optional arguments to filter what variables are returned from
+:code:`System.list_inputs` and :code:`System.list_outputs`. Here are some short examples showing this feature.
+
+.. embed-code::
+    openmdao.core.tests.test_impl_comp.ListFeatureTestCase.test_for_docs_list_includes_excludes
+    :layout: interleave
+
+
+*List Variables Filtered by Tags*
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When you add inputs and outputs to components, you can optionally set tags on the variables. These tags can then be
+used to filter what variables are printed and returned by the :code:`System.list_inputs` and :code:`System.list_outputs`
+methods. Each of those methods has an optional argument :code:`tags` for that purpose.
+
+Here is a simple example to show you how this works. Imagine that a model-builder builds a model with some set of
+variables they expect other non-model-builder users to vary. They want to classify the inputs into
+two sets: "beginner" and "advanced". The model-builder would like to write some functions that query the model
+for the set of `beginner` and `advanced` inputs and do some stuff with those lists (like make fancy formatted outputs or something).
+
+
+.. embed-code::
+    openmdao.test_suite.test_examples.test_betz_limit.TestBetzLimit.test_betz_with_var_tags
+    :layout: interleave
+
+Notice that if you only have one tag, you can set the argument :code:`tags` to a string. If you have
+more than one tag, you use a list of strings.
+
+This example showed how to add tags when using the :code:`add_input` and :code:`add_output` methods. You can also
+add tags to :code:`IndepVarComp` and :code:`ExecComp` Components using code like this:
+
+::
+
+    comp = IndepVarComp('indep_var', tags='tag1')
+
+::
+
+    ec = om.ExecComp('y=x+z+1.',
+                      x={'value': 1.0, 'units': 'm', 'tags': 'tagx'},
+                      y={'units': 'm', 'tags': ['tagy','tagm']},
+                      z={'value': 2.0, 'tags': 'tagz'},
+                      ))
+
+Note that outputs of :code:`IndepVarComp` are always tagged with :code:`indep_var_comp`.
 
 *List Residuals Above a Tolerance*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -144,14 +194,36 @@ scaling (res, res0, and res_ref) for the variables.
 ~~~~~~~~~~~~~~~~~~~~
 
 The :code:`list_inputs()` and :code:`list_outputs()` methods both have a :code:`print_arrays` option.
-By default, this option is set to False and only the norm of the array will appear in the tabular display. 
-The norm value is surrounded by vertical bars to indicate that it is a norm. 
-When the option is set to True, the complete value of the array will also be a displayed below the row. 
+By default, this option is set to False and only the norm of the array will appear in the tabular display.
+The norm value is surrounded by vertical bars to indicate that it is a norm.
+When the option is set to True, the complete value of the array will also be a displayed below the row.
 The format is affected by the values set with :code:`numpy.set_printoptions`.
 
 .. embed-code::
     openmdao.core.tests.test_expl_comp.ExplCompTestCase.test_for_docs_array_list_vars_options
     :layout: interleave
+
+
+.. note::
+
+   It is normally required to run the model before :code:`list_inputs()` and :code:`list_outputs()` can be used.
+   This is because the final setup that occurs just before execution determines the hierarchy and builds the
+   data structures and connections.  In some cases however, it can be useful to call these functions on a
+   system prior to execution to assist in configuring your model. At :code:`configure` time,
+   basic metadata about a system's inputs and outputs is available.
+   See the documentation for the :ref:`configure() method<feature_configure_IO>` for one such use case.
+
+
+*List Global Shape*
+~~~~~~~~~~~~~~~~~~~
+
+When working with :ref:`distributed components<distributed_components>`, it may also be useful to display the
+global shape of a variable as well as the shape on the current processor.  Note that this information is not
+available until after the model has been completely set up and run.
+
+.. embed-code::
+  openmdao.core.tests.test_distrib_list_vars.MPIFeatureTests.test_distribcomp_list_feature
+  :layout: interleave
 
 
 *Listing Problem Variables*

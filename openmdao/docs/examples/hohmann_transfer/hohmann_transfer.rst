@@ -69,7 +69,7 @@ change in inclination due to the impulse (:math:`\Delta i`), the :math:`\Delta V
 is then computed from the law of cosines:
 
 .. math::
-    \Delta V_1 = v_c^2 + v_p^2 - 2 v_c v_p \cos{\Delta i}
+    \Delta V_1 = \sqrt{v_c^2 + v_p^2 - 2 v_c v_p \cos{\Delta i}}
 
 In the first impulse, :math:`v_1` is the circular velocity in LEO.  In
 this case :math:`v_c` refers to the circular velocity in geostationary
@@ -185,11 +185,7 @@ Putting it all together
 
 Now we assemble the model for our problem.
 
-An IndepVarComp provides values for the gravitational parameter, the radii
-of the two circular orbits, and the delta-V to be performed at each of the
-two impulses.
-
-Next, two instances of VCircComp are used to compute the velocity of the
+Two instances of VCircComp are used to compute the velocity of the
 spacecraft in the initial and final circular orbits.
 
 The TransferOrbitComp is used to compute the periapsis and apoapsis velocity
@@ -198,13 +194,17 @@ of the spacecraft in the transfer orbit.
 Now we can use the DeltaVComp to provide the magnitude of the delta-V
 at each of the two impulses.
 
-Lastly, we use two ExecComps to provide some simple calculations.  One
+We use two ExecComps to provide some simple calculations.  One
 sums the delta-Vs of the two impulses to provide the total delta-V of the
 transfer.  We will use this as the objective for the optimization.
 
 The other ExecComp sums up the inclination change at each impulse.  We
 will provide this to the driver as a constraint to ensure that our total
 inclination change meets our requirements.
+
+Lastly, we provide unambiguous values and units for the gravitational parameter, the radii
+of the two circular orbits, and the delta-V to be performed at each of the
+two impulses.
 
 We will use the initial and final radii of the orbits, and the inclination
 change at each of the two impulses as our design variables.

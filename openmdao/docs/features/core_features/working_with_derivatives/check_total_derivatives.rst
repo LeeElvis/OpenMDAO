@@ -4,15 +4,19 @@
 Checking Total Derivatives
 **************************
 
-If you want to check the analytic derivatives of your model (or just part of it) against finite difference or complex-step approximations, you can use :code:`check_totals()`. You should always converge your model
-before calling this method. By default, this method checks the derivatives of all of the driver responses (objectives, constraints) with respect to the des_vars, though you can also specify the
+If you want to check the analytic derivatives of your model (or just part of it) against finite difference or complex-step
+approximations, you can use :code:`check_totals()`. You should always converge your model
+before calling this method. By default, this method checks the derivatives of all of the driver responses
+(objectives, constraints) with respect to the des_vars, though you can also specify the
 variables you want to check. Derivatives are computed
-and compared in an unscaled form by default, but you can optionally request for them to be computed in scaled form using the `ref` and `ref0` that were declared when adding the
+and compared in an unscaled form by default, but you can optionally request for them to be computed in
+scaled form using the `ref` and `ref0` that were declared when adding the
 constraints, objectives, and des_vars.
 
 .. note::
     You should probably **not** use this method until you've used :code:`check_partials()` to verify the
-    partials for each component in your model. :code:`check_totals()` is a blunt instrument, since it can only tell you that there is a problem, but will not give you much insight into which component or group is causing the problem.
+    partials for each component in your model. :code:`check_totals()` is a blunt instrument, since it can
+    only tell you that there is a problem, but will not give you much insight into which component or group is causing the problem.
 
 .. automethod:: openmdao.core.problem.Problem.check_totals
     :noindex:
@@ -55,7 +59,7 @@ Display the results in a compact format:
 ----
 
 Use complex step instead of finite difference for a more accurate check. We also tighten the tolerance
-on the nonlinear Gauss-Seidel solver so that we get more accuracate converged values.
+on the nonlinear Gauss-Seidel solver so that we get more accurate converged values.
 
 .. embed-code::
     openmdao.core.tests.test_problem.TestProblem.test_feature_check_totals_cs

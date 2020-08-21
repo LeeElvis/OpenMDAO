@@ -3,19 +3,16 @@ This is a multipoint implementation of the beam optimization problem.
 
 
 """
-from __future__ import division
-from six.moves import range
-
 import numpy as np
 
 import openmdao.api as om
 
-from openmdao.test_suite.test_examples.beam_optimization.components.compliance_comp import MultiComplianceComp
-from openmdao.test_suite.test_examples.beam_optimization.components.displacements_comp import MultiDisplacementsComp
 from openmdao.test_suite.test_examples.beam_optimization.components.local_stiffness_matrix_comp import LocalStiffnessMatrixComp
 from openmdao.test_suite.test_examples.beam_optimization.components.moment_comp import MomentOfInertiaComp
-from openmdao.test_suite.test_examples.beam_optimization.components.states_comp import MultiStatesComp
+from openmdao.test_suite.test_examples.beam_optimization.components.multi_compliance_comp import MultiComplianceComp
+from openmdao.test_suite.test_examples.beam_optimization.components.multi_states_comp import MultiStatesComp
 from openmdao.test_suite.test_examples.beam_optimization.components.volume_comp import VolumeComp
+from openmdao.utils.spline_distributions import sine_distribution
 
 
 def divide_cases(ncases, nprocs):
@@ -71,12 +68,9 @@ class MultipointBeamGroup(om.Group):
         num_cp = self.options['num_cp']
         num_load_cases = self.options['num_load_cases']
 
-        inputs_comp = om.IndepVarComp()
-        inputs_comp.add_output('h_cp', shape=num_cp)
-        self.add_subsystem('inputs_comp', inputs_comp)
-
-        comp = om.BsplinesComp(num_control_points=num_cp, num_points=num_elements,
-                               in_name='h_cp', out_name='h')
+        x_interp = sine_distribution(num_elements)
+        comp = om.SplineComp(method='bsplines', num_cp=num_cp, x_interp_val=x_interp)
+        comp.add_spline(y_cp_name='h_cp', y_interp_name='h')
         self.add_subsystem('interp', comp)
 
         I_comp = MomentOfInertiaComp(num_elements=num_elements, b=b)
@@ -114,9 +108,6 @@ class MultipointBeamGroup(om.Group):
             comp = MultiStatesComp(num_elements=num_elements, force_vector=force_vector, num_rhs=num_rhs)
             sub.add_subsystem('states_comp', comp)
 
-            comp = MultiDisplacementsComp(num_elements=num_elements, num_rhs=num_rhs)
-            sub.add_subsystem('displacements_comp', comp)
-
             comp = MultiComplianceComp(num_elements=num_elements, force_vector=force_vector,
                                        num_rhs=num_rhs)
             sub.add_subsystem('compliance_comp', comp)
@@ -126,12 +117,9 @@ class MultipointBeamGroup(om.Group):
                 'parallel.%s.states_comp.K_local' % name)
 
             for k in range(num_rhs):
-                sub.connect(
-                    'states_comp.d_%d' % k,
-                    'displacements_comp.d_%d' % k)
-                sub.connect(
-                    'displacements_comp.displacements_%d' % k,
-                    'compliance_comp.displacements_%d' % k)
+                sub.connect('states_comp.d_%d' % k,
+                            'compliance_comp.displacements_%d' % k,
+                            src_indices=np.arange(2 *num_nodes))
 
                 obj_srcs.append('parallel.%s.compliance_comp.compliance_%d' % (name, k))
 
@@ -144,11 +132,10 @@ class MultipointBeamGroup(om.Group):
         for j, src in enumerate(obj_srcs):
             self.connect(src, 'obj_sum.compliance_%d' % j)
 
-        self.connect('inputs_comp.h_cp', 'interp.h_cp')
         self.connect('interp.h', 'I_comp.h')
         self.connect('I_comp.I', 'local_stiffness_matrix_comp.I')
         self.connect('interp.h', 'volume_comp.h')
 
-        self.add_design_var('inputs_comp.h_cp', lower=1e-2, upper=10.)
+        self.add_design_var('interp.h_cp', lower=1e-2, upper=10.)
         self.add_constraint('volume_comp.volume', equals=volume)
         self.add_objective('obj_sum.obj')

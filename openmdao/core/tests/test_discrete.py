@@ -4,18 +4,17 @@ import sys
 import unittest
 import copy
 
-from six import assertRaisesRegex, StringIO, assertRegex
-
+from io import StringIO
 import numpy as np
 
 import openmdao.api as om
-from openmdao.core.group import get_relevant_vars
 from openmdao.core.driver import Driver
-from openmdao.devtools.problem_viewer.problem_viewer import _get_viewer_data
-from openmdao.test_suite.components.paraboloid import Paraboloid
+from openmdao.visualization.n2_viewer.n2_viewer import _get_viewer_data
 from openmdao.test_suite.components.sellar import StateConnection, \
      SellarDis1withDerivatives, SellarDis2withDerivatives
-from openmdao.utils.assert_utils import assert_rel_error
+from openmdao.utils.assert_utils import assert_near_equal
+from openmdao.utils.general_utils import remove_whitespace
+from openmdao.utils.logger_utils import TestLogger
 
 
 class ModCompEx(om.ExplicitComponent):
@@ -26,8 +25,8 @@ class ModCompEx(om.ExplicitComponent):
     def setup(self):
         self.add_input('a', val=10.)
         self.add_output('b', val=0.)
-        self.add_discrete_input('x', val=10)
-        self.add_discrete_output('y', val=0)
+        self.add_discrete_input('x', val=10, tags='tagx')
+        self.add_discrete_output('y', val=0, tags='tagy')
 
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         outputs['b'] = inputs['a']*2.
@@ -40,8 +39,8 @@ class ModCompIm(om.ImplicitComponent):
         self.modval = modval
 
     def setup(self):
-        self.add_discrete_input('x', val=10)
-        self.add_discrete_output('y', val=0)
+        self.add_discrete_input('x', val=10, tags='tagx')
+        self.add_discrete_output('y', val=0, tags='tagy')
 
     def apply_nonlinear(self, inputs, outputs, residuals, discrete_inputs, discrete_outputs):
         discrete_outputs['y'] = discrete_inputs['x'] % self.modval
@@ -155,12 +154,16 @@ class _DiscreteVal(object):
         self._val *= val
         return self
 
+    def __eq__(self, val):
+        if isinstance(val, _DiscreteVal):
+            return self._val == val.getval()
+        return False
 
 class PathCompEx(om.ExplicitComponent):
 
     def setup(self):
-        self.add_discrete_input('x', val=self.pathname)
-        self.add_discrete_output('y', val=self.pathname + '/')
+        self.add_discrete_input('x', val='')
+        self.add_discrete_output('y', val='')
 
     def compute(self, inputs, outputs, discrete_inputs, discrete_outputs):
         discrete_outputs['y'] = discrete_inputs['x'] + self.pathname + '/'
@@ -194,7 +197,7 @@ class DiscreteTestCase(unittest.TestCase):
         prob.setup()
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], 2)
+        assert_near_equal(prob['comp.y'], 2)
 
     def test_simple_run_once_promoted(self):
         prob = om.Problem()
@@ -207,7 +210,7 @@ class DiscreteTestCase(unittest.TestCase):
         prob.setup()
         prob.run_model()
 
-        assert_rel_error(self, prob['y'], 2)
+        assert_near_equal(prob['y'], 2)
 
     def test_simple_run_once_implicit(self):
         prob = om.Problem()
@@ -222,7 +225,7 @@ class DiscreteTestCase(unittest.TestCase):
         prob.setup()
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], 2)
+        assert_near_equal(prob['comp.y'], 2)
 
     def test_list_inputs_outputs(self):
         prob = om.Problem()
@@ -237,6 +240,39 @@ class DiscreteTestCase(unittest.TestCase):
         model.connect('indep.x', ['expl.x', 'impl.x'])
 
         prob.setup()
+
+        #
+        # list vars before model has been run (relative names)
+        #
+        expl_inputs = prob.model.expl.list_inputs(out_stream=None)
+        expected = {
+            'a': {'value': [10.]},
+            'x': {'value': 10}
+        }
+        self.assertEqual(dict(expl_inputs), expected)
+
+        impl_inputs = prob.model.impl.list_inputs(out_stream=None)
+        expected = {
+            'x': {'value': 10}
+        }
+        self.assertEqual(dict(impl_inputs), expected)
+
+        expl_outputs = prob.model.expl.list_outputs(out_stream=None)
+        expected = {
+            'b': {'value': [0.]},
+            'y': {'value': 0}
+        }
+        self.assertEqual(dict(expl_outputs), expected)
+
+        impl_outputs = prob.model.impl.list_outputs(out_stream=None)
+        expected = {
+            'y': {'value': 0}
+        }
+        self.assertEqual(dict(impl_outputs), expected)
+
+        #
+        # run model
+        #
         prob.run_model()
 
         #
@@ -259,11 +295,10 @@ class DiscreteTestCase(unittest.TestCase):
         text = stream.getvalue()
 
         self.assertEqual(1, text.count("3 Input(s) in 'model'"))
-        self.assertEqual(1, text.count('top'))
-        self.assertEqual(1, text.count('  expl'))
-        self.assertEqual(1, text.count('    a'))
-        self.assertEqual(1, text.count('  impl'))
-        self.assertEqual(2, text.count('    x'))      # both implicit & explicit
+        self.assertEqual(1, text.count('\nexpl'))
+        self.assertEqual(1, text.count('\n  a'))
+        self.assertEqual(1, text.count('\nimpl'))
+        self.assertEqual(2, text.count('\n  x'))      # both implicit & explicit
 
         #
         # list outputs, not hierarchical
@@ -286,13 +321,131 @@ class DiscreteTestCase(unittest.TestCase):
         prob.model.list_outputs(values=True, residuals=True, hierarchical=True, out_stream=stream)
         text = stream.getvalue()
 
-        self.assertEqual(text.count('top'), 2)        # both implicit & explicit
-        self.assertEqual(text.count('  indep'), 1)
-        self.assertEqual(text.count('    x'), 1)
-        self.assertEqual(text.count('  expl'), 1)
-        self.assertEqual(text.count('    b'), 1)
-        self.assertEqual(text.count('  impl'), 1)
-        self.assertEqual(text.count('    y'), 2)      # both implicit & explicit
+        self.assertEqual(text.count('\nindep'), 1)
+        self.assertEqual(text.count('\n  x'), 1)
+        self.assertEqual(text.count('\nexpl'), 1)
+        self.assertEqual(text.count('\n  b'), 1)
+        self.assertEqual(text.count('\nimpl'), 1)
+        self.assertEqual(text.count('\n  y'), 2)      # both implicit & explicit
+
+    def test_list_inputs_outputs_promoted(self):
+        model = om.Group()
+
+        model.add_subsystem('expl', ModCompEx(3), promotes_inputs=['x'])
+        model.add_subsystem('impl', ModCompIm(3), promotes_inputs=['x'])
+
+        prob = om.Problem(model)
+        prob.setup()
+
+        prob['x'] = 11
+
+        prob.run_model()
+
+        #
+        # list inputs
+        #
+        stream = StringIO()
+
+        model.list_inputs(hierarchical=False, prom_name=True, out_stream=stream)
+
+        text = stream.getvalue().split('\n')
+
+        expected = [
+            "3 Input(s) in 'model'",
+            "---------------------",
+            "",
+            "varname  value  prom_name",
+            "-------  -----  ---------",
+            "expl.a   [10.]  expl.a",
+            "expl.x   11     x",
+            "impl.x   11     x",
+        ]
+
+        for i, line in enumerate(expected):
+            if line and not line.startswith('-'):
+                self.assertEqual(remove_whitespace(text[i]), remove_whitespace(line))
+
+        #
+        # list outputs
+        #
+        stream = StringIO()
+
+        model.list_outputs(prom_name=True, out_stream=stream, list_autoivcs=True)
+
+        text = stream.getvalue().split('\n')
+
+        expected = [
+            "4 Explicit Output(s) in 'model'",
+            "-------------------------------",
+            "",
+            "varname  value  prom_name",
+            "-------  -----  ---------",
+            "_auto_ivc",
+            "  v0    [10.]  _auto_ivc.v0",
+            "  v1    11     _auto_ivc.v1",
+            "expl",
+            "  b    [20.]  expl.b",
+            "  y    2      expl.y",
+            "",
+            "",
+            "1 Implicit Output(s) in 'model'",
+            "-------------------------------",
+            "",
+            "varname  value  prom_name",
+            "-------  -----  ---------",
+            "impl",
+            "  y    2      impl.y",
+        ]
+
+        for i, line in enumerate(expected):
+            if line and not line.startswith('-'):
+                self.assertEqual(remove_whitespace(text[i]), remove_whitespace(line))
+
+    def test_list_inputs_outputs_with_tags(self):
+        prob = om.Problem()
+        model = prob.model
+
+        indep = model.add_subsystem('indep', om.IndepVarComp())
+        indep.add_discrete_output('x', 11)
+
+        model.add_subsystem('expl', ModCompEx(3))
+        model.add_subsystem('impl', ModCompIm(3))
+
+        model.connect('indep.x', ['expl.x', 'impl.x'])
+
+        prob.setup()
+        prob.run_model()
+
+        # list inputs, no tags
+        inputs = prob.model.list_inputs(values=False, out_stream=None)
+        self.assertEqual(sorted(inputs), [
+            ('expl.a', {}),
+            ('expl.x', {}),
+            ('impl.x', {}),
+        ])
+
+        # list inputs, with tags
+        inputs = prob.model.list_inputs(values=False, out_stream=None, tags='tagx')
+        self.assertEqual(sorted(inputs), [
+            ('expl.x', {}),
+            ('impl.x', {}),
+        ])
+
+        # list outputs, no tags
+        outputs = prob.model.list_outputs(values=False, out_stream=None)
+        self.assertEqual(sorted(outputs), [
+            ('expl.b', {}),
+            ('expl.y', {}),
+            ('impl.y', {}),
+            ('indep.x', {}),
+        ])
+
+        # list outputs, with tags
+        outputs = prob.model.list_outputs(values=False, out_stream=None, tags='tagy')
+        self.assertEqual(sorted(outputs), [
+            ('expl.y', {}),
+            ('impl.y', {}),
+        ])
 
     def test_float_to_discrete_error(self):
         prob = om.Problem()
@@ -307,7 +460,7 @@ class DiscreteTestCase(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             prob.setup()
         self.assertEqual(str(ctx.exception),
-                         "Group (<model>): Can't connect discrete output 'indep.x' to continuous input 'comp.x'.")
+                         "Group (<model>): Can't connect continuous output 'indep.x' to discrete input 'comp.x'.")
 
     def test_discrete_to_float_error(self):
         prob = om.Problem()
@@ -354,17 +507,17 @@ class DiscreteTestCase(unittest.TestCase):
         prob.driver = DiscreteDriver()
         prob.setup()
 
+        msg = "Only integer scalars or ndarrays are supported as values " + \
+              "for discrete variables when used as a design variable. %s " + \
+              "was specified."
+
         # Insert a non integer
         prob['indep.x'] = 3.7
 
         with self.assertRaises(Exception) as ctx:
             prob.run_driver()
 
-        msg = "Only integer scalars or ndarrays are supported as values for " + \
-              "discrete variables when used as a design variable. "
-        msg += "A value of type 'float' was specified."
-
-        self.assertEqual(str(ctx.exception), msg)
+        self.assertEqual(str(ctx.exception), msg % "A value of type 'float'")
 
         # Insert a float ndarray
         prob['indep.x'] = np.array([3.0])
@@ -372,11 +525,7 @@ class DiscreteTestCase(unittest.TestCase):
         with self.assertRaises(Exception) as ctx:
             prob.run_driver()
 
-        msg = "Only integer scalars or ndarrays are supported as values for " + \
-              "discrete variables when used as a design variable. "
-        msg += "An array of type 'float64' was specified."
-
-        self.assertEqual(str(ctx.exception), msg)
+        self.assertEqual(str(ctx.exception), msg % "An array of type 'float64'")
 
         # Make sure these work.
 
@@ -411,19 +560,20 @@ class DiscreteTestCase(unittest.TestCase):
         model = prob.model
 
         indep = model.add_subsystem('indep', om.IndepVarComp())
-        indep.add_output('x', 1.0, ref=10.)
-        indep.add_discrete_output('N', 1)
+        indep.add_output('x', 1.0)
 
-        comp = model.add_subsystem('comp', CompDiscWDerivsImplicit())
+        comp = model.add_subsystem('comp', CompDiscWDerivsImplicit(), promotes=['N'])
         sink = model.add_subsystem('sink', MixedCompDiscIn(1.0))
         model.connect('indep.x', 'comp.y2_actual')
-        model.connect('indep.N', 'comp.N')
         model.connect('comp.Nout', 'sink.x')
 
         model.add_design_var('indep.x')
         model.add_objective('comp.y2_command')
 
         prob.setup()
+
+        prob['N'] = 1
+
         prob.run_model()
 
         J = prob.compute_totals(return_format='array')
@@ -466,6 +616,36 @@ class DiscreteTestCase(unittest.TestCase):
             J = prob.compute_totals()
         self.assertEqual(str(ctx.exception),
                          "Total derivative with respect to 'indep.x' depends upon discrete output variables ['G.G1.C1.y'].")
+
+    def test_connection_to_output(self):
+        prob = om.Problem()
+        model = prob.model
+
+        model.add_subsystem('C1', ModCompEx(modval=2))
+        model.add_subsystem('C2', ModCompEx(modval=2))
+
+        model.connect('C1.y', 'C2.y')
+
+        with self.assertRaises(Exception) as cm:
+            prob.setup()
+
+        msg = "Group (<model>): Attempted to connect from 'C1.y' to 'C2.y', but 'C2.y' is an output. All connections must be from an output to an input."
+        self.assertEqual(str(cm.exception), msg)
+
+    def test_connection_from_input(self):
+        prob = om.Problem()
+        model = prob.model
+
+        model.add_subsystem('C1', ModCompEx(modval=2))
+        model.add_subsystem('C2', ModCompEx(modval=2))
+
+        model.connect('C1.x', 'C2.x')
+
+        with self.assertRaises(Exception) as cm:
+            prob.setup()
+
+        msg = "Group (<model>): Attempted to connect from 'C1.x' to 'C2.x', but 'C1.x' is an input. All connections must be from an output to an input."
+        self.assertEqual(str(cm.exception), msg)
 
 
 class SolverDiscreteTestCase(unittest.TestCase):
@@ -533,9 +713,6 @@ class DiscretePromTestCase(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        indep = model.add_subsystem('indep', om.IndepVarComp(), promotes_outputs=['x'])
-        indep.add_discrete_output('x', 'indep/')
-
         G = model.add_subsystem('G', om.ParallelGroup(), promotes_inputs=['x'])
 
         G1 = G.add_subsystem('G1', om.Group(), promotes_inputs=['x'], promotes_outputs=['y'])
@@ -555,12 +732,15 @@ class DiscretePromTestCase(unittest.TestCase):
         model.connect('G.G2.y', 'C4.x')
 
         prob.setup()
+
+        prob['x'] = 'indep/'
+
         prob.run_model()
 
         self.assertEqual(prob['C3.y'], 'indep/G.G1.C1_1/G.G1.C1_2/C3/')
         self.assertEqual(prob['C4.y'], 'indep/G.G2.C2_1/G.G2.C2_2/C4/')
 
-        prob['indep.x'] = 'foobar/'
+        prob['x'] = 'foobar/'
         prob.run_model()
 
         self.assertEqual(prob['C3.y'], 'foobar/G.G1.C1_1/G.G1.C1_2/C3/')
@@ -570,9 +750,6 @@ class DiscretePromTestCase(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        indep = model.add_subsystem('indep', om.IndepVarComp(), promotes_outputs=['x'])
-        indep.add_discrete_output('x', _DiscreteVal(19))
-
         G = model.add_subsystem('G', om.ParallelGroup(), promotes_inputs=['x'])
 
         G1 = G.add_subsystem('G1', om.Group(), promotes_inputs=['x'], promotes_outputs=['y'])
@@ -581,7 +758,7 @@ class DiscretePromTestCase(unittest.TestCase):
         G1.connect('C1_1.y', 'C1_2.x')
 
         G2 = G.add_subsystem('G2', om.Group(), promotes_inputs=['x'])
-        G2.add_subsystem('C2_1', ObjAdderCompEx(_DiscreteVal(1)), promotes_inputs=['x'])
+        G2.add_subsystem('C2_1', ObjAdderCompEx(_DiscreteVal(5)), promotes_inputs=['x'])
         G2.add_subsystem('C2_2', ObjAdderCompEx(_DiscreteVal(11)), promotes_outputs=['y'])
         G2.connect('C2_1.y', 'C2_2.x')
 
@@ -592,10 +769,13 @@ class DiscretePromTestCase(unittest.TestCase):
         model.connect('G.G2.y', 'C4.x')
 
         prob.setup()
+
+        prob['x'] =  _DiscreteVal(19)
+
         prob.run_model()
 
         self.assertEqual(prob['C3.y'].getval(), 40)
-        self.assertEqual(prob['C4.y'].getval(), 52)
+        self.assertEqual(prob['C4.y'].getval(), 56)
 
         def _var_iter(obj):
             name = obj['name']
@@ -612,7 +792,7 @@ class DiscretePromTestCase(unittest.TestCase):
         # add a test to see if discrete vars show up in n2
         data = _get_viewer_data(prob)
         findvars = [
-            'indep.x',
+            '_auto_ivc.v0',
             'G.G1.C1_1.x',
             'G.G1.C1_1.y',
             'G.G1.C1_2.x',
@@ -631,6 +811,7 @@ class DiscretePromTestCase(unittest.TestCase):
 
 
 class DiscreteFeatureTestCase(unittest.TestCase):
+
     def test_feature_discrete(self):
         import numpy as np
         import openmdao.api as om
@@ -658,19 +839,70 @@ class DiscreteFeatureTestCase(unittest.TestCase):
 
         # build the model
         prob = om.Problem()
-        indeps = prob.model.add_subsystem('indeps', om.IndepVarComp(), promotes=['*'])
-        indeps.add_output('r_m', 3.2, units="ft")
-        indeps.add_output('chord', .3, units='ft')
-        indeps.add_discrete_output('num_blades', 2)
 
         prob.model.add_subsystem('SolidityComp', BladeSolidity(),
                                  promotes_inputs=['r_m', 'chord', 'num_blades'])
 
         prob.setup()
+
+        prob.set_val('num_blades', 2)
+        prob.set_val('r_m', 3.2)
+        prob.set_val('chord', .3)
+
         prob.run_model()
 
         # minimum value
-        assert_rel_error(self, prob['SolidityComp.blade_solidity'], 0.02984155, 1e-4)
+        assert_near_equal(prob['SolidityComp.blade_solidity'], 0.02984155, 1e-4)
+
+    def test_feature_discrete_implicit(self):
+        import openmdao.api as om
+
+        class ImpWithInitial(om.ImplicitComponent):
+            """
+            An implicit component to solve the quadratic equation: x^2 - 4x + 3
+            (solutions at x=1 and x=3)
+            """
+            def setup(self):
+                self.add_input('a', val=1.)
+                self.add_input('b', val=-4.)
+                self.add_discrete_input('c', val=3)
+                self.add_output('x', val=5.)
+
+                self.declare_partials(of='*', wrt='*')
+
+            def apply_nonlinear(self, inputs, outputs, residuals, discrete_inputs, discrete_outputs):
+                a = inputs['a']
+                b = inputs['b']
+                c = discrete_inputs['c']
+                x = outputs['x']
+                residuals['x'] = a * x ** 2 + b * x + c
+
+            def linearize(self, inputs, outputs, partials, discrete_inputs, discrete_outputs):
+                a = inputs['a']
+                b = inputs['b']
+                x = outputs['x']
+
+                partials['x', 'a'] = x ** 2
+                partials['x', 'b'] = x
+                partials['x', 'x'] = 2 * a * x + b
+
+            def guess_nonlinear(self, inputs, outputs, resids, discrete_inputs, discrete_outputs):
+                # Default initial state of zero for x takes us to x=1 solution.
+                # Here we set it to a value that will take us to the x=3 solution.
+                outputs['x'] = 5
+
+        prob = om.Problem()
+        model = prob.model
+
+        model.add_subsystem('comp', ImpWithInitial())
+
+        model.comp.nonlinear_solver = om.NewtonSolver(solve_subsystems=False)
+        model.comp.linear_solver = om.ScipyKrylov()
+
+        prob.setup()
+        prob.run_model()
+
+        assert_near_equal(prob.get_val('comp.x'), 3., 1e-4)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,17 @@
 """ Unit tests for the design_variable and response interface to system."""
-from __future__ import print_function
-
-from six.moves import range
-
 import unittest
 
 import numpy as np
 
-from openmdao.api import Problem, NonlinearBlockGS, Group, IndepVarComp, ExecComp, ScipyKrylov
-from openmdao.utils.assert_utils import assert_rel_error
+from openmdao.api import Problem, NonlinearBlockGS, Group, IndepVarComp, ExecComp, ScipyKrylov,  \
+    IndepVarComp, ScipyOptimizeDriver
+from openmdao.utils.assert_utils import assert_near_equal
 from openmdao.utils.mpi import MPI
 
 from openmdao.test_suite.components.sellar import SellarDerivatives, SellarDis1withDerivatives, \
      SellarDis2withDerivatives
+
+from openmdao.core.tests.test_distribcomp import DistribInputDistribOutputComp
 
 try:
     from openmdao.vectors.petsc_vector import PETScVector
@@ -21,31 +20,6 @@ except ImportError:
 
 
 class TestDesVarsResponses(unittest.TestCase):
-
-    def test_api_backwards_compatible(self):
-        raise unittest.SkipTest("api not implemented yet")
-
-        prob = Problem()
-        prob.model = SellarDerivatives()
-        prob.model.nonlinear_solver = NonlinearBlockGS()
-
-        prob.driver = ScipyOpt()
-        prob.driver.options['method'] = 'slsqp'
-        prob.driver.add_design_var('x', lower=-100, upper=100)
-        prob.driver.add_design_var('z', lower=-100, upper=100)
-        prob.driver.add_objective('obj')
-        prob.driver.add_constraint('con1')
-        prob.driver.add_constraint('con2')
-
-        prob.setup()
-
-        des_vars = prob.model.get_des_vars()
-        obj = prob.model.get_objectives()
-        constraints = prob.model.get_constraints()
-
-        self.assertItemsEqual(des_vars.keys(), ('x', 'z'))
-        self.assertItemsEqual(obj.keys(), ('obj',))
-        self.assertItemsEqual(constraints.keys(), ('con1', 'con2'))
 
     def test_api_on_model(self):
 
@@ -66,7 +40,7 @@ class TestDesVarsResponses(unittest.TestCase):
         obj = prob.model.get_objectives()
         constraints = prob.model.get_constraints()
 
-        self.assertEqual(set(des_vars.keys()), {'px.x', 'pz.z'})
+        self.assertEqual(set(des_vars.keys()), {'x', 'z'})
         self.assertEqual(set(obj.keys()), {'obj_cmp.obj'})
         self.assertEqual(set(constraints.keys()), {'con_cmp1.con1', 'con_cmp2.con2'})
 
@@ -90,7 +64,7 @@ class TestDesVarsResponses(unittest.TestCase):
         obj = prob.model.get_objectives()
         constraints = prob.model.get_constraints()
 
-        self.assertEqual(set(des_vars.keys()), {'px.x', 'pz.z'})
+        self.assertEqual(set(des_vars.keys()), {'x', 'z'})
         self.assertEqual(set(obj.keys()), {'obj_cmp.obj'})
         self.assertEqual(set(constraints.keys()), {'con_cmp1.con1', 'con_cmp2.con2'})
         self.assertEqual(set(responses.keys()), {'obj_cmp.obj', 'con_cmp1.con1', 'con_cmp2.con2'})
@@ -114,7 +88,7 @@ class TestDesVarsResponses(unittest.TestCase):
         obj = prob.model.get_objectives()
         constraints = prob.model.get_constraints()
 
-        self.assertEqual(set(des_vars.keys()), {'px.x', 'pz.z'})
+        self.assertEqual(set(des_vars.keys()), {'x', 'z'})
         self.assertEqual(set(obj.keys()), {'obj_cmp.obj',})
         self.assertEqual(set(constraints.keys()), {'con_cmp1.con1', 'con_cmp2.con2'})
 
@@ -139,7 +113,7 @@ class TestDesVarsResponses(unittest.TestCase):
         obj = prob.model.get_objectives()
         constraints = prob.model.get_constraints()
 
-        self.assertEqual(set(des_vars.keys()), {'px.x', 'pz.z'})
+        self.assertEqual(set(des_vars.keys()), {'x', 'z'})
         self.assertEqual(set(obj.keys()), {'obj_cmp.obj',})
         self.assertEqual(set(constraints.keys()), {'con_cmp1.con1', 'con_cmp2.con2'})
 
@@ -165,7 +139,7 @@ class TestDesVarsResponses(unittest.TestCase):
         obj = prob.model.get_objectives()
         constraints = prob.model.get_constraints()
 
-        self.assertEqual(set(des_vars.keys()), {'px.x', 'pz.z'})
+        self.assertEqual(set(des_vars.keys()), {'x', 'z'})
         self.assertEqual(set(obj.keys()), {'obj_cmp.obj',})
         self.assertEqual(set(constraints.keys()), {'con_cmp1.con1', 'con_cmp2.con2'})
 
@@ -293,10 +267,10 @@ class TestDesvarOnModel(unittest.TestCase):
 
         des_vars = prob.model.get_design_vars()
 
-        x_ref0 = des_vars['px.x']['ref0']
-        x_ref = des_vars['px.x']['ref']
-        x_scaler = des_vars['px.x']['scaler']
-        x_adder = des_vars['px.x']['adder']
+        x_ref0 = des_vars['x']['ref0']
+        x_ref = des_vars['x']['ref']
+        x_scaler = des_vars['x']['scaler']
+        x_adder = des_vars['x']['adder']
 
         self.assertAlmostEqual( x_scaler*(x_ref0 + x_adder), 0.0, places=12)
         self.assertAlmostEqual( x_scaler*(x_ref + x_adder), 1.0, places=12)
@@ -319,8 +293,8 @@ class TestDesvarOnModel(unittest.TestCase):
 
         des_vars = prob.model.get_design_vars()
 
-        self.assertFalse(np.isinf(des_vars['px.x']['upper']))
-        self.assertFalse(np.isinf(-des_vars['px.x']['lower']))
+        self.assertFalse(np.isinf(des_vars['x']['upper']))
+        self.assertFalse(np.isinf(-des_vars['x']['lower']))
 
         responses = prob.model.get_responses()
 
@@ -494,25 +468,77 @@ class TestConstraintOnModel(unittest.TestCase):
         self.assertEqual(str(context.exception), 'SellarDerivatives: The name argument should '
                                                  'be a string, got 42')
 
-    def test_constraint_invalid_bounds(self):
+    def test_constraint_invalid_lower(self):
 
         prob = Problem()
 
-        prob.model = SellarDerivatives()
-        prob.model.nonlinear_solver = NonlinearBlockGS()
+        prob.driver = ScipyOptimizeDriver()
+        prob.driver.options['optimizer'] = 'SLSQP'
 
         with self.assertRaises(TypeError) as context:
             prob.model.add_constraint('con1', lower='foo', upper=[0, 100],
                                       ref0=-100.0, ref=100)
 
-        self.assertEqual(str(context.exception), 'Expected values of lower to be an '
-                                                 'Iterable of numeric values, '
-                                                 'or a scalar numeric value. '
-                                                 'Got foo instead.')
-
-        with self.assertRaises(ValueError) as context:
-            prob.model.add_constraint('con1', lower=0.0, upper=['a', 'b'],
+        with self.assertRaises(TypeError) as context2:
+            prob.model.add_constraint('con1', lower=['zero', 5], upper=[0, 100],
                                       ref0=-100.0, ref=100)
+
+        msg = ("Argument 'lower' can not be a string ('foo' given). You can not "
+        "specify a variable as lower bound. You can only provide constant "
+        "float values")
+        self.assertEqual(str(context.exception), msg)
+
+        msg2 = ("Argument 'lower' can not be a string ('['zero', 5]' given). You can not "
+        "specify a variable as lower bound. You can only provide constant "
+        "float values")
+        self.assertEqual(str(context2.exception), msg2)
+
+    def test_constraint_invalid_upper(self):
+
+        prob = Problem()
+
+        prob.driver = ScipyOptimizeDriver()
+        prob.driver.options['optimizer'] = 'SLSQP'
+
+        with self.assertRaises(TypeError) as context:
+            prob.model.add_constraint('con1', lower=0, upper='foo',
+                                      ref0=-100.0, ref=100)
+
+        with self.assertRaises(TypeError) as context2:
+            prob.model.add_constraint('con1', lower=0, upper=[1, 'foo'],
+                                      ref0=-100.0, ref=100)
+
+        msg = ("Argument 'upper' can not be a string ('foo' given). You can not "
+        "specify a variable as upper bound. You can only provide constant "
+        "float values")
+        self.assertEqual(str(context.exception), msg)
+
+        msg2 = ("Argument 'upper' can not be a string ('[1, 'foo']' given). You can not "
+        "specify a variable as upper bound. You can only provide constant "
+        "float values")
+        self.assertEqual(str(context2.exception), msg2)
+
+    def test_constraint_invalid_equals(self):
+        prob = Problem()
+
+        prob.driver = ScipyOptimizeDriver()
+        prob.driver.options['optimizer'] = 'SLSQP'
+
+        with self.assertRaises(TypeError) as context:
+            prob.model.add_constraint('con1', equals='foo')
+
+        with self.assertRaises(TypeError) as context2:
+            prob.model.add_constraint('con1', equals=[1, 'two'])
+
+        msg = ("Argument 'equals' can not be a string ('foo' given). You can "
+               "not specify a variable as equals bound. You can only provide "
+               "constant float values")
+        self.assertEqual(str(context.exception), msg)
+
+        msg2 = ("Argument 'equals' can not be a string ('[1, 'two']' given). You can "
+               "not specify a variable as equals bound. You can only provide "
+               "constant float values")
+        self.assertEqual(str(context2.exception), msg2)
 
     def test_constraint_invalid_indices(self):
 
@@ -560,7 +586,7 @@ class TestConstraintOnModel(unittest.TestCase):
         self.assertEqual(str(context.exception), msg)
 
 
-@unittest.skipUnless(MPI and PETScVector, "MPI and PETSc is required.")
+@unittest.skipUnless(MPI and PETScVector, "MPI and PETSc are required.")
 class TestAddConstraintMPI(unittest.TestCase):
 
     N_PROCS = 2

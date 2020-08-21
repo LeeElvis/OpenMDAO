@@ -4,13 +4,12 @@ import unittest
 from tempfile import mkdtemp
 from shutil import rmtree
 
-from six.moves import range
-
 from openmdao.api import Problem, Group, IndepVarComp, ExecComp, ExplicitComponent, \
-    LinearBlockGS, NonlinearBlockGS, SqliteRecorder
+    LinearBlockGS, NonlinearBlockGS, SqliteRecorder, ParallelGroup
 
 from openmdao.utils.logger_utils import TestLogger
 from openmdao.error_checking.check_config import get_sccs_topo
+from openmdao.utils.assert_utils import assert_warning, assert_no_warning
 
 
 class MyComp(ExecComp):
@@ -19,35 +18,6 @@ class MyComp(ExecComp):
 
 
 class TestCheckConfig(unittest.TestCase):
-
-    def test_hanging_inputs(self):
-        p = Problem()
-        root = p.model
-
-        G1 = root.add_subsystem("G1", Group(), promotes=['*'])
-        G2 = G1.add_subsystem("G2", Group(), promotes=['*'])
-        G2.add_subsystem("C2", IndepVarComp('x', 1.0), promotes=['*'])
-        G2.add_subsystem("C1", ExecComp('y=x*2.0+w'), promotes=['*'])
-
-        G3 = root.add_subsystem("G3", Group())
-        G4 = G3.add_subsystem("G4", Group())
-        G4.add_subsystem("C3", ExecComp('y=x*2.0+u'), promotes=['*'])
-        G4.add_subsystem("C4", ExecComp('y=x*2.0+v'))
-
-        testlogger = TestLogger()
-        p.setup(check='all', logger=testlogger)
-        p.final_setup()
-
-        expected = (
-            "The following inputs are not connected:\n"
-            "   G3.G4.C4.v\n"
-            "   G3.G4.C4.x\n"
-            "   G3.G4.u: ['G3.G4.C3.u']\n"
-            "   G3.G4.x: ['G3.G4.C3.x']\n"
-            "   w: ['G1.G2.C1.w']\n"
-        )
-
-        self.assertTrue(testlogger.contains('warning', expected))
 
     def test_dataflow_1_level(self):
         p = Problem()
@@ -88,8 +58,135 @@ class TestCheckConfig(unittest.TestCase):
             "   System 'C3' executes out-of-order with respect to its source systems ['C4']\n"
         )
 
-        self.assertTrue(testlogger.contains('info', expected_info))
-        self.assertTrue(testlogger.contains('warning', expected_warning))
+        testlogger.find_in('info', expected_info)
+        testlogger.find_in('warning', expected_warning)
+
+    def test_parallel_group_order(self):
+        prob = Problem()
+        model = prob.model
+
+        model.add_subsystem('p1', IndepVarComp('x', 1.0))
+        model.add_subsystem('p2', IndepVarComp('x', 1.0))
+
+        parallel = model.add_subsystem('parallel', ParallelGroup())
+        parallel.add_subsystem('c1', ExecComp(['y=-2.0*x']))
+        parallel.add_subsystem('c2', ExecComp(['y=5.0*x']))
+        parallel.connect('c1.y', 'c2.x')
+
+        parallel = model.add_subsystem('parallel_copy', ParallelGroup())
+        parallel.add_subsystem('comp1', ExecComp(['y=-2.0*x']))
+        parallel.add_subsystem('comp2', ExecComp(['y=5.0*x']))
+        parallel.connect('comp1.y', 'comp2.x')
+
+        model.add_subsystem('c3', ExecComp(['y=3.0*x1+7.0*x2']))
+        model.add_subsystem('c4', ExecComp(['y=3.0*x_copy_1+7.0*x_copy_2']))
+
+        model.connect("parallel.c1.y", "c3.x1")
+        model.connect("parallel.c2.y", "c3.x2")
+        model.connect("parallel_copy.comp1.y", "c4.x_copy_1")
+        model.connect("parallel_copy.comp2.y", "c4.x_copy_2")
+
+        model.connect("p1.x", "parallel.c1.x")
+        model.connect("p1.x", "parallel_copy.comp1.x")
+
+        testlogger = TestLogger()
+        prob.setup(check=True, mode='fwd', logger=testlogger)
+
+        msg = "Need to attach NonlinearBlockJac, NewtonSolver, or BroydenSolver to 'parallel' when " \
+              "connecting components inside parallel groups"
+
+        with assert_warning(UserWarning, msg):
+            prob.run_model()
+
+        expected_warning = ("The following systems are executed out-of-order:\n"
+                            "   System 'parallel.c2' executes out-of-order with respect to its source systems ['parallel.c1']\n"
+                            "   System 'parallel_copy.comp2' executes out-of-order with respect to its source systems ['parallel_copy.comp1']\n")
+
+        testlogger.find_in('warning', expected_warning)
+
+    def test_serial_in_parallel(self):
+        prob = Problem()
+        model = prob.model
+
+        model.add_subsystem('p1', IndepVarComp('x', 1.0))
+
+        parallel = model.add_subsystem('parallel', ParallelGroup())
+        parallel.add_subsystem('c1', ExecComp(['y=-2.0*x']))
+
+        parallel2 = model.add_subsystem('parallel_copy', ParallelGroup())
+        parallel2.add_subsystem('comp1', ExecComp(['y=-2.0*x']))
+
+        model.add_subsystem('con', ExecComp('y = 3.0*x'))
+
+        model.connect("p1.x", "parallel.c1.x")
+        model.connect('parallel.c1.y', 'parallel_copy.comp1.x')
+        model.connect('parallel_copy.comp1.y', 'con.x')
+
+        prob.setup(check=True)
+
+        msg = ("The following systems are executed out-of-order:\n"
+               "   System 'parallel.c2' executes out-of-order with respect to its source systems ['parallel.c1']\n")
+
+        with assert_no_warning(UserWarning, msg):
+            prob.run_model()
+
+    def test_single_parallel_group_order(self):
+        prob = Problem()
+        model = prob.model
+
+        model.add_subsystem('p1', IndepVarComp('x', 1.0))
+        model.add_subsystem('p2', IndepVarComp('x', 1.0))
+
+        parallel = model.add_subsystem('parallel', ParallelGroup())
+        parallel.add_subsystem('c1', ExecComp(['y=-2.0*x']))
+        parallel.add_subsystem('c2', ExecComp(['y=5.0*x']))
+        parallel.connect('c1.y', 'c2.x')
+
+        model.add_subsystem('c3', ExecComp(['y=3.0*x1+7.0*x2']))
+
+        model.connect("parallel.c1.y", "c3.x1")
+        model.connect("parallel.c2.y", "c3.x2")
+
+        model.connect("p1.x", "parallel.c1.x")
+
+        testlogger = TestLogger()
+        prob.setup(check=True, mode='fwd', logger=testlogger)
+
+        msg = "Need to attach NonlinearBlockJac, NewtonSolver, or BroydenSolver to 'parallel' when " \
+              "connecting components inside parallel groups"
+
+        with assert_warning(UserWarning, msg):
+            prob.run_model()
+
+        expected_warning = ("The following systems are executed out-of-order:\n"
+                            "   System 'parallel.c2' executes out-of-order with respect to its source systems ['parallel.c1']\n")
+
+        testlogger.find_in('warning', expected_warning)
+
+    def test_no_connect_parallel_group(self):
+        prob = Problem()
+        model = prob.model
+
+        traj = model.add_subsystem('traj', ParallelGroup())
+
+        burn1 = traj.add_subsystem('burn1', Group())
+        burn1.add_subsystem('p1', IndepVarComp('x', 1.0))
+        burn1.add_subsystem('burn_eq1', ExecComp(['y=-2.0*x']))
+        burn1.connect('p1.x', 'burn_eq1.x')
+
+        burn2 = traj.add_subsystem('burn2', Group())
+        burn2.add_subsystem('p2', IndepVarComp('x', 1.0))
+        burn2.add_subsystem('burn_eq2', ExecComp(['y=5.0*x']))
+        burn2.connect('p2.x', 'burn_eq2.x')
+
+        testlogger = TestLogger()
+        prob.setup(check=True, mode='fwd', logger=testlogger)
+
+        msg = "Need to attach NonlinearBlockJac, NewtonSolver, or BroydenSolver to 'parallel' when " \
+              "connecting components inside parallel groups"
+
+        with assert_no_warning(UserWarning, msg):
+            prob.run_model()
 
     def test_dataflow_multi_level(self):
         p = Problem()
@@ -135,8 +232,8 @@ class TestCheckConfig(unittest.TestCase):
             "   System 'G1.C1' executes out-of-order with respect to its source systems ['G1.C2']\n"
         )
 
-        self.assertTrue(testlogger.contains('info', expected_info))
-        self.assertTrue(testlogger.contains('warning', expected_warning))
+        testlogger.find_in('info', expected_info)
+        testlogger.find_in('warning', expected_warning)
 
         # test comps_only cycle check
         graph = root.compute_sys_graph(comps_only=True)
@@ -171,8 +268,8 @@ class TestCheckConfig(unittest.TestCase):
             "   C1 has inputs ['a', 'b'] connected to C2.y\n"
         )
 
-        self.assertTrue(testlogger.contains('warning', expected_warning_1))
-        self.assertTrue(testlogger.contains('warning', expected_warning_2))
+        testlogger.find_in('warning', expected_warning_1)
+        testlogger.find_in('warning', expected_warning_2)
 
     def test_multi_cycles(self):
         p = Problem()
@@ -225,7 +322,7 @@ class TestCheckConfig(unittest.TestCase):
             "   System 'G1.C3' executes out-of-order with respect to its source systems ['G1.C11']\n"
         )
 
-        self.assertTrue(testlogger.contains('warning', expected_warning_1))
+        testlogger.find_in('warning', expected_warning_1)
 
     def test_multi_cycles_non_default(self):
         p = Problem()
@@ -284,22 +381,8 @@ class TestCheckConfig(unittest.TestCase):
             "   System 'G1.C3' executes out-of-order with respect to its source systems ['G1.C11']\n"
         )
 
-        expected_warning_2 = (
-            "The following inputs are not connected:\n"
-            "   G1.C1.b\n"
-            "   G1.C11.b\n"
-            "   G1.C13.b\n"
-            "   G1.C22.b\n"
-            "   G1.C23.b\n"
-            "   G1.N1.a\n"
-            "   G1.N1.b\n"
-            "   G1.N2.a\n"
-            "   G1.N3.a\n"
-        )
-
-        self.assertTrue(testlogger.contains('info', expected_info))
-        self.assertTrue(testlogger.contains('warning', expected_warning_1))
-        self.assertTrue(testlogger.contains('warning', expected_warning_2))
+        testlogger.find_in('info', expected_info)
+        testlogger.find_in('warning', expected_warning_1)
 
     def test_comp_has_no_outputs(self):
         p = Problem()
@@ -321,7 +404,33 @@ class TestCheckConfig(unittest.TestCase):
             "   comp1\n"
         )
 
-        self.assertTrue(testlogger.contains('warning', expected))
+        testlogger.find_in('warning', expected)
+
+    def test_initial_condition_order(self):
+        # Makes sure we set vars to their initial condition before running checks.
+
+        class TestComp(ExplicitComponent):
+
+            def setup(self):
+                self.add_input('x', 37.0)
+                self.add_output('y', 45.0)
+
+            def check_config(self, logger):
+                x = self._vectors['input']['nonlinear']['x']
+                if x != 75.0:
+                    raise ValueError('Check config is being called before initial conditions are set.')
+
+            def compute(self, inputs, outputs, discrete_inputs=None, discrete_outputs=None):
+                outputs['y'] = inputs['x']
+
+        prob = Problem()
+        prob.model.add_subsystem('comp', TestComp())
+
+        prob.setup(check='all')
+
+        prob['comp.x'] = 75.0
+
+        prob.final_setup()
 
 
 class TestRecorderCheckConfig(unittest.TestCase):
@@ -351,7 +460,7 @@ class TestRecorderCheckConfig(unittest.TestCase):
         p.final_setup()
 
         expected_warning = "The Problem has no recorder of any kind attached"
-        self.assertTrue(testlogger.contains('warning', expected_warning))
+        testlogger.find_in('warning', expected_warning)
 
     def test_check_driver_recorder_set(self):
         p = Problem()

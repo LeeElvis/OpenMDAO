@@ -1,17 +1,16 @@
 """Test for a feature doc showing how to use cache_linear_solution"""
-from __future__ import division
-
 from distutils.version import LooseVersion
 import unittest
 from copy import deepcopy
-from six.moves import cStringIO
+from io import StringIO
+
 
 import numpy as np
 import scipy
 from scipy.sparse.linalg import gmres
 
 import openmdao.api as om
-from openmdao.utils.assert_utils import assert_rel_error
+from openmdao.utils.assert_utils import assert_near_equal
 
 
 class CacheLinearTestCase(unittest.TestCase):
@@ -93,10 +92,7 @@ class CacheLinearTestCase(unittest.TestCase):
         p.driver = om.ScipyOptimizeDriver()
         p.driver.options['optimizer'] = 'SLSQP'
 
-        indeps = p.model.add_subsystem('indeps', om.IndepVarComp(), promotes_outputs=['a', 'b', 'c'])
-        indeps.add_output('a', 1.)
-        indeps.add_output('b', 4.)
-        indeps.add_output('c', 1.)
+        p.model.set_input_defaults('b', val=4.)
         p.model.add_subsystem('quad', QuadraticComp(), promotes_inputs=['a', 'b', 'c'], promotes_outputs=['states'])
         p.model.add_subsystem('obj', om.ExecComp('y = (x[1]-x[0])**2', x=np.ones(2)))
         p.model.connect('states', 'obj.x')
@@ -110,7 +106,7 @@ class CacheLinearTestCase(unittest.TestCase):
 
         print(p['a'], p['b'], p['c'])
         print(p['states'])
-        assert_rel_error(self, p['obj.y'], 0.25029766, 1e-3)
+        assert_near_equal(p['obj.y'], 0.25029766, 1e-3)
 
 
 if __name__ == "__main__":

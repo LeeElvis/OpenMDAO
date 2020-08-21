@@ -1,13 +1,12 @@
-from __future__ import print_function, division, absolute_import
-
 import itertools
 import unittest
 import math
-from six import iteritems
 
 import numpy as np
 from numpy.testing import assert_almost_equal
 import scipy
+
+from distutils.version import LooseVersion
 
 try:
     from parameterized import parameterized
@@ -16,7 +15,7 @@ except ImportError:
 
 import openmdao.api as om
 from openmdao.components.exec_comp import _expr_dict
-from openmdao.utils.assert_utils import assert_rel_error
+from openmdao.utils.assert_utils import assert_near_equal, assert_check_partials, assert_warning
 
 _ufunc_test_data = {
     'abs': {
@@ -116,11 +115,6 @@ _ufunc_test_data = {
     'expm1': {
         'str': 'f=expm1(x)',
         'check_func': np.expm1,
-        'args': {'f': {'value': np.zeros(6)},
-                 'x': {'value': np.random.random(6)}}},
-    'factorial': {
-        'str': 'f=factorial(x)',
-        'check_func': scipy.special.factorial,
         'args': {'f': {'value': np.zeros(6)},
                  'x': {'value': np.random.random(6)}}},
     'fmax': {
@@ -257,6 +251,28 @@ _ufunc_test_data = {
 }
 
 
+# 'factorial' will raise a RuntimeError or a deprecation warning depending on scipy version
+if LooseVersion(scipy.__version__) >= LooseVersion("1.5.0"):
+    _ufunc_test_data['factorial'] = {
+        'str': 'f=factorial(x)',
+        'args': {'f': {'value': np.zeros(6)},
+                 'x': {'value': np.random.random(6)}},
+        'error': (RuntimeError,
+                  "The 'factorial' function is not supported for SciPy "
+                  f"versions >= 1.5, current version: {scipy.__version__}")
+    }
+else:
+    _ufunc_test_data['factorial'] = {
+        'str': 'f=factorial(x)',
+        'check_func': scipy.special.factorial,
+        'args': {'f': {'value': np.zeros(6)},
+                 'x': {'value': np.random.random(6)}},
+        'warning': (DeprecationWarning,
+                    "The 'factorial' function is deprecated. "
+                    "It is no longer supported for SciPy versions >= 1.5.")
+    }
+
+
 class TestExecComp(unittest.TestCase):
 
     def test_no_expr(self):
@@ -336,7 +352,7 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], 45.0, 0.00001)
+        assert_near_equal(C1._outputs['y'], 45.0, 0.00001)
 
     def test_simple(self):
         prob = om.Problem()
@@ -353,7 +369,7 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], 3.0, 0.00001)
+        assert_near_equal(C1._outputs['y'], 3.0, 0.00001)
 
     def test_for_spaces(self):
         prob = om.Problem()
@@ -371,7 +387,7 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], 2 * math.pi, 0.00001)
+        assert_near_equal(C1._outputs['y'], 2 * math.pi, 0.00001)
 
     def test_units(self):
         prob = om.Problem()
@@ -387,7 +403,7 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], 4.0, 0.00001)
+        assert_near_equal(C1._outputs['y'], 4.0, 0.00001)
 
     def test_units_varname(self):
         prob = om.Problem()
@@ -440,7 +456,7 @@ class TestExecComp(unittest.TestCase):
         prob.setup()
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], 4.0, 0.00001)
+        assert_near_equal(prob['comp.y'], 4.0, 0.00001)
 
     def test_common_units_no_meta(self):
         # make sure common units are assigned when no metadata is provided
@@ -454,7 +470,7 @@ class TestExecComp(unittest.TestCase):
         prob.setup()
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], 2001., 0.00001)
+        assert_near_equal(prob['comp.y'], 2001., 0.00001)
 
     def test_conflicting_units(self):
         prob = om.Problem()
@@ -590,7 +606,46 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], math.sin(2.0), 0.00001)
+        assert_near_equal(C1._outputs['y'], math.sin(2.0), 0.00001)
+
+    def test_np(self):
+        prob = om.Problem()
+        prob.model.add_subsystem('C1', om.ExecComp(['y1=sin(x)', 'y2=np.cos(x)'], x=2.0))
+        prob.setup()
+
+        with self.assertRaises(Exception) as context:
+          prob.run_model()
+
+        self.assertEqual(str(context.exception),
+            "ExecComp (C1): Error occurred evaluating 'y2=np.cos(x)'\n"
+            "    ExecComp supports a subset of numpy functions directly, without the 'np' prefix.\n"
+            "    'cos' is supported (See the documentation).")
+
+    def test_numpy(self):
+        prob = om.Problem()
+        prob.model.add_subsystem('C1', om.ExecComp('y=numpy.sin(x)', x=2.0))
+        prob.setup()
+
+        with self.assertRaises(Exception) as context:
+          prob.run_model()
+
+        self.assertEqual(str(context.exception),
+            "ExecComp (C1): Error occurred evaluating 'y=numpy.sin(x)'\n"
+            "    ExecComp supports a subset of numpy functions directly, without the 'numpy' prefix.\n"
+            "    'sin' is supported (See the documentation).")
+
+    def test_numpy_fft(self):
+        prob = om.Problem()
+        prob.model.add_subsystem('C1', om.ExecComp('y=numpy.fft(x)', x=2.0))
+        prob.setup()
+
+        with self.assertRaises(Exception) as context:
+          prob.run_model()
+
+        self.assertEqual(str(context.exception),
+            "ExecComp (C1): Error occurred evaluating 'y=numpy.fft(x)'\n"
+            "    ExecComp supports a subset of numpy functions directly, without the 'numpy' prefix.\n"
+            "    'fft' is not supported (See the documentation).")
 
     def test_array(self):
         prob = om.Problem()
@@ -609,7 +664,7 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], 2.0, 0.00001)
+        assert_near_equal(C1._outputs['y'], 2.0, 0.00001)
 
     def test_array_lhs(self):
         prob = om.Problem()
@@ -628,7 +683,7 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], np.array([2., 1.]), 0.00001)
+        assert_near_equal(C1._outputs['y'], np.array([2., 1.]), 0.00001)
 
     def test_simple_array_model(self):
         prob = om.Problem()
@@ -645,12 +700,7 @@ class TestExecComp(unittest.TestCase):
 
         data = prob.check_partials(out_stream=None)
 
-        assert_rel_error(self, data['comp'][('y', 'x')]['abs error'][0], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['abs error'][1], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['abs error'][2], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['rel error'][0], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['rel error'][1], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['rel error'][2], 0.0, 1e-5)
+        assert_check_partials(data, atol=1e-5, rtol=1e-5)
 
     def test_simple_array_model2(self):
         prob = om.Problem()
@@ -667,12 +717,7 @@ class TestExecComp(unittest.TestCase):
 
         data = prob.check_partials(out_stream=None)
 
-        assert_rel_error(self, data['comp'][('y', 'x')]['abs error'][0], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['abs error'][1], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['abs error'][2], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['rel error'][0], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['rel error'][1], 0.0, 1e-5)
-        assert_rel_error(self, data['comp'][('y', 'x')]['rel error'][2], 0.0, 1e-5)
+        assert_check_partials(data, atol=1e-5, rtol=1e-5)
 
     def test_complex_step(self):
         prob = om.Problem()
@@ -689,11 +734,11 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], 5.0, 0.00001)
+        assert_near_equal(C1._outputs['y'], 5.0, 0.00001)
 
         C1._linearize()
 
-        assert_rel_error(self, C1._jacobian[('y', 'x')], [[2.0]], 0.00001)
+        assert_near_equal(C1._jacobian[('y', 'x')], [[2.0]], 0.00001)
 
     def test_complex_step2(self):
         prob = om.Problem(om.Group())
@@ -706,13 +751,13 @@ class TestExecComp(unittest.TestCase):
         prob.run_model()
 
         J = prob.compute_totals(['comp.y'], ['p1.x'], return_format='flat_dict')
-        assert_rel_error(self, J['comp.y', 'p1.x'], np.array([[6.0]]), 0.00001)
+        assert_near_equal(J['comp.y', 'p1.x'], np.array([[6.0]]), 0.00001)
 
         prob.setup(check=False, mode='rev')
         prob.run_model()
 
         J = prob.compute_totals(['comp.y'], ['p1.x'], return_format='flat_dict')
-        assert_rel_error(self, J['comp.y', 'p1.x'], np.array([[6.0]]), 0.00001)
+        assert_near_equal(J['comp.y', 'p1.x'], np.array([[6.0]]), 0.00001)
 
     def test_abs_complex_step(self):
         prob = om.Problem()
@@ -722,20 +767,20 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], 4.0, 0.00001)
+        assert_near_equal(C1._outputs['y'], 4.0, 0.00001)
 
         # any positive C1.x should give a 2.0 derivative for dy/dx
         C1._inputs['x'] = 1.0e-10
         C1._linearize()
-        assert_rel_error(self, C1._jacobian['y', 'x'], [[2.0]], 0.00001)
+        assert_near_equal(C1._jacobian['y', 'x'], [[2.0]], 0.00001)
 
         C1._inputs['x'] = -3.0
         C1._linearize()
-        assert_rel_error(self, C1._jacobian['y', 'x'], [[-2.0]], 0.00001)
+        assert_near_equal(C1._jacobian['y', 'x'], [[-2.0]], 0.00001)
 
         C1._inputs['x'] = 0.0
         C1._linearize()
-        assert_rel_error(self, C1._jacobian['y', 'x'], [[2.0]], 0.00001)
+        assert_near_equal(C1._jacobian['y', 'x'], [[2.0]], 0.00001)
 
     def test_abs_array_complex_step(self):
         prob = om.Problem()
@@ -746,20 +791,20 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, C1._outputs['y'], np.ones(3)*4.0, 0.00001)
+        assert_near_equal(C1._outputs['y'], np.ones(3)*4.0, 0.00001)
 
         # any positive C1.x should give a 2.0 derivative for dy/dx
         C1._inputs['x'] = np.ones(3)*1.0e-10
         C1._linearize()
-        assert_rel_error(self, C1._jacobian['y', 'x'], np.eye(3)*2.0, 0.00001)
+        assert_near_equal(C1._jacobian['y', 'x'], np.eye(3)*2.0, 0.00001)
 
         C1._inputs['x'] = np.ones(3)*-3.0
         C1._linearize()
-        assert_rel_error(self, C1._jacobian['y', 'x'], np.eye(3)*-2.0, 0.00001)
+        assert_near_equal(C1._jacobian['y', 'x'], np.eye(3)*-2.0, 0.00001)
 
         C1._inputs['x'] = np.zeros(3)
         C1._linearize()
-        assert_rel_error(self, C1._jacobian['y', 'x'], np.eye(3)*2.0, 0.00001)
+        assert_near_equal(C1._jacobian['y', 'x'], np.eye(3)*2.0, 0.00001)
 
         C1._inputs['x'] = np.array([1.5, -0.6, 2.4])
         C1._linearize()
@@ -768,7 +813,7 @@ class TestExecComp(unittest.TestCase):
         expect[1, 1] = -2.0
         expect[2, 2] = 2.0
 
-        assert_rel_error(self, C1._jacobian['y', 'x'], expect, 0.00001)
+        assert_near_equal(C1._jacobian['y', 'x'], expect, 0.00001)
 
     def test_has_diag_partials_error(self):
         p = om.Problem()
@@ -801,21 +846,86 @@ class TestExecComp(unittest.TestCase):
 
         assert_almost_equal(J, np.eye(5)*3., decimal=6)
 
+    def test_tags(self):
+        prob = om.Problem(model=om.Group())
+        prob.model.add_subsystem('indep', om.IndepVarComp('x', 100.0, units='cm'))
+        C1 = prob.model.add_subsystem('C1', om.ExecComp('y=x+z+1.',
+                                                     x={'value': 1.0, 'units': 'm', 'tags': 'tagx'},
+                                                     y={'units': 'm', 'tags': ['tagy','tagq']},
+                                                     z={'value': 2.0, 'tags': 'tagz'},
+                                                     ))
+        prob.model.connect('indep.x', 'C1.x')
+
+        prob.setup(check=False)
+
+        prob.set_solver_print(level=0)
+        prob.run_model()
+
+        # Inputs no tags
+        inputs = prob.model.list_inputs(values=False, out_stream=None)
+        self.assertEqual(sorted(inputs), [
+            ('C1.x', {}),
+            ('C1.z', {}),
+        ])
+
+        # Inputs with tags
+        inputs = prob.model.list_inputs(values=False, out_stream=None, tags="tagx")
+        self.assertEqual(sorted(inputs), [
+            ('C1.x', {}),
+        ])
+
+        # Inputs with multiple tags
+        inputs = prob.model.list_inputs(values=False, out_stream=None, tags=["tagx", "tagz"])
+        self.assertEqual(sorted(inputs), [
+            ('C1.x', {}),
+            ('C1.z', {}),
+        ])
+
+        # Inputs with tag that does not match
+        inputs = prob.model.list_inputs(values=False, out_stream=None, tags="tag_wrong")
+        self.assertEqual(sorted(inputs), [])
+
+        # Outputs no tags
+        outputs = prob.model.list_outputs(values=False, out_stream=None)
+        self.assertEqual(sorted(outputs), [
+            ('C1.y', {}),
+            ('indep.x', {}),
+        ])
+
+        # Outputs with tags
+        outputs = prob.model.list_outputs(values=False, out_stream=None, tags="tagy")
+        self.assertEqual(sorted(outputs), [
+            ('C1.y', {}),
+        ])
+
+        # Outputs with multiple tags
+        outputs = prob.model.list_outputs(values=False, out_stream=None, tags=["tagy", "tagx"])
+        self.assertEqual(sorted(outputs), [
+            ('C1.y', {}),
+        ])
+
+        # Outputs with tag that does not match
+        outputs = prob.model.list_outputs(values=False, out_stream=None, tags="tag_wrong")
+        self.assertEqual(sorted(outputs), [])
+
     def test_feature_has_diag_partials(self):
         import numpy as np
         import openmdao.api as om
 
         p = om.Problem()
         model = p.model
-        model.add_subsystem('indep', om.IndepVarComp('x', val=np.ones(5)))
 
-        model.add_subsystem('comp', om.ExecComp('y=3.0*x + 2.5', has_diag_partials=True, x=np.ones(5), y=np.ones(5)))
-        model.connect('indep.x', 'comp.x')
+        model.add_subsystem('comp', om.ExecComp('y=3.0*x + 2.5',
+                                                has_diag_partials=True,
+                                                x=np.ones(5), y=np.ones(5)))
 
         p.setup()
+
+        p.set_val('comp.x', np.ones(5))
+
         p.run_model()
 
-        J = p.compute_totals(of=['comp.y'], wrt=['indep.x'], return_format='array')
+        J = p.compute_totals(of=['comp.y'], wrt=['comp.x'], return_format='array')
 
         assert_almost_equal(J, np.eye(5)*3., decimal=6)
 
@@ -825,17 +935,16 @@ class TestExecComp(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        model.add_subsystem('p', om.IndepVarComp('x', 2.0))
         model.add_subsystem('comp', om.ExecComp('y=x+1.'))
 
-        model.connect('p.x', 'comp.x')
+        model.set_input_defaults('comp.x', 2.0)
 
         prob.setup()
 
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], 3.0, 0.00001)
+        assert_near_equal(prob.get_val('comp.y'), 3.0, 0.00001)
 
     def test_feature_multi_output(self):
         import openmdao.api as om
@@ -843,18 +952,17 @@ class TestExecComp(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        model.add_subsystem('p', om.IndepVarComp('x', 2.0))
-        model.add_subsystem('comp', om.ExecComp(['y1=x+1.', 'y2=x-1.']))
-
-        model.connect('p.x', 'comp.x')
+        model.add_subsystem('comp', om.ExecComp(['y1=x+1.', 'y2=x-1.']), promotes=['x'])
 
         prob.setup()
+
+        prob.set_val('x', 2.0)
 
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y1'], 3.0, 0.00001)
-        assert_rel_error(self, prob['comp.y2'], 1.0, 0.00001)
+        assert_near_equal(prob.get_val('comp.y1'), 3.0, 0.00001)
+        assert_near_equal(prob.get_val('comp.y2'), 1.0, 0.00001)
 
     def test_feature_array(self):
         import numpy as np
@@ -864,18 +972,16 @@ class TestExecComp(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        model.add_subsystem('p', om.IndepVarComp('x', np.array([1., 2., 3.])))
         model.add_subsystem('comp', om.ExecComp('y=x[1]',
                                                 x=np.array([1., 2., 3.]),
                                                 y=0.0))
-        model.connect('p.x', 'comp.x')
 
         prob.setup()
 
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], 2.0, 0.00001)
+        assert_near_equal(prob.get_val('comp.y'), 2.0, 0.00001)
 
     def test_feature_math(self):
         import numpy as np
@@ -885,19 +991,17 @@ class TestExecComp(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        model.add_subsystem('p1', om.IndepVarComp('x', np.pi/2.0))
-        model.add_subsystem('p2', om.IndepVarComp('y', np.pi/2.0))
         model.add_subsystem('comp', om.ExecComp('z = sin(x)**2 + cos(y)**2'))
 
-        model.connect('p1.x', 'comp.x')
-        model.connect('p2.y', 'comp.y')
-
         prob.setup()
+
+        prob.set_val('comp.x', np.pi/2.0)
+        prob.set_val('comp.y', np.pi/2.0)
 
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.z'], 1.0, 0.00001)
+        assert_near_equal(prob.get_val('comp.z'), 1.0, 0.00001)
 
     def test_feature_numpy(self):
         import numpy as np
@@ -916,7 +1020,7 @@ class TestExecComp(unittest.TestCase):
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], 6.0, 0.00001)
+        assert_near_equal(prob['comp.y'], 6.0, 0.00001)
 
     def test_feature_metadata(self):
         import openmdao.api as om
@@ -924,48 +1028,44 @@ class TestExecComp(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        model.add_subsystem('p1', om.IndepVarComp('x', 12.0, units='inch'))
-        model.add_subsystem('p2', om.IndepVarComp('y', 1.0, units='ft'))
         model.add_subsystem('comp', om.ExecComp('z=x+y',
                                                 x={'value': 0.0, 'units': 'inch'},
                                                 y={'value': 0.0, 'units': 'inch'},
                                                 z={'value': 0.0, 'units': 'inch'}))
-        model.connect('p1.x', 'comp.x')
-        model.connect('p2.y', 'comp.y')
 
         prob.setup()
+
+        prob.set_val('comp.x', 12.0, units='inch')
+        prob.set_val('comp.y', 1.0, units='ft')
 
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.z'], 24.0, 0.00001)
+        assert_near_equal(prob.get_val('comp.z'), 24.0, 0.00001)
 
     def test_feature_options(self):
         import openmdao.api as om
 
         model = om.Group()
 
-        indep = model.add_subsystem('indep', om.IndepVarComp('x', shape=(2,), units='cm'))
         xcomp = model.add_subsystem('comp', om.ExecComp('y=2*x', shape=(2,)))
 
         xcomp.options['units'] = 'm'
 
-        model.connect('indep.x', 'comp.x')
-
         prob = om.Problem(model)
         prob.setup()
 
-        prob['indep.x'] = [100., 200.]
+        prob.set_val('comp.x', [100., 200.], units='cm')
 
         prob.run_model()
 
-        assert_rel_error(self, prob['comp.y'], [2., 4.], 0.00001)
+        assert_near_equal(prob.get_val('comp.y'), [2., 4.], 0.00001)
 
 
 class TestExecCompParameterized(unittest.TestCase):
 
     @parameterized.expand(itertools.product([
-      func_name for func_name in _expr_dict if not func_name.startswith('_')
+      func_name for func_name in _expr_dict if func_name not in ('np', 'numpy', '__builtins__')
     ]), name_func=lambda f, n, p: 'test_exec_comp_value_' + '_'.join(a for a in p.args))
     def test_exec_comp_value(self, f):
         test_data = _ufunc_test_data[f]
@@ -975,7 +1075,7 @@ class TestExecCompParameterized(unittest.TestCase):
 
         if len(test_data['args']) > 1:
             ivc = model.add_subsystem(name='ivc', subsys=om.IndepVarComp())
-            for arg_name, arg_value in iteritems(test_data['args']):
+            for arg_name, arg_value in test_data['args'].items():
                 if arg_name == 'f':
                     continue
                 ivc.add_output(name=arg_name, val=arg_value['value'])
@@ -984,7 +1084,18 @@ class TestExecCompParameterized(unittest.TestCase):
         model.add_subsystem('comp', om.ExecComp(test_data['str'], **test_data['args']),
                             promotes_outputs=['f'])
         prob.setup()
-        prob.run_model()
+
+        if 'error' in test_data:
+            err, msg = test_data['error']
+            with self.assertRaises(err) as cm:
+                prob.run_model()
+            self.assertTrue(msg in str(cm.exception))
+            return
+        elif 'warning' in test_data:
+            with assert_warning(*test_data['warning']):
+                prob.run_model()
+        else:
+            prob.run_model()
 
         if 'check_func' in test_data:
             check_args = []
@@ -1010,7 +1121,7 @@ class TestExecCompParameterized(unittest.TestCase):
                 print(f, 'does not support complex-step differentiation')
 
     @parameterized.expand(itertools.product([
-      func_name for func_name in _expr_dict if not func_name.startswith('_')
+      func_name for func_name in _expr_dict if func_name not in ('np', 'numpy', '__builtins__')
     ]), name_func=lambda f, n, p: 'test_exec_comp_jac_' + '_'.join(a for a in p.args))
     def test_exec_comp_jac(self, f):
         test_data = _ufunc_test_data[f]
@@ -1020,7 +1131,7 @@ class TestExecCompParameterized(unittest.TestCase):
 
         if len(test_data['args']) > 1:
             ivc = model.add_subsystem(name='ivc', subsys=om.IndepVarComp())
-            for arg_name, arg_value in iteritems(test_data['args']):
+            for arg_name, arg_value in test_data['args'].items():
                 if arg_name == 'f':
                     continue
                 ivc.add_output(name=arg_name, val=arg_value['value'])
@@ -1031,14 +1142,25 @@ class TestExecCompParameterized(unittest.TestCase):
                             om.ExecComp(test_data['str'], **test_data['args']),
                             promotes_outputs=['f'])
         prob.setup()
-        prob.run_model()
+
+        if 'error' in test_data:
+            err, msg = test_data['error']
+            with self.assertRaises(err) as cm:
+                prob.run_model()
+            self.assertTrue(msg in str(cm.exception))
+            return
+        elif 'warning' in test_data:
+            with assert_warning(*test_data['warning']):
+                prob.run_model()
+        else:
+            prob.run_model()
 
         if 'check_val' not in test_data:
             cpd = prob.check_partials(out_stream=None)
 
             for comp in cpd:
                 for (var, wrt) in cpd[comp]:
-                    np.testing.assert_almost_equal(cpd[comp][var, wrt]['abs error'], 0, decimal=4)
+                    np.testing.assert_almost_equal(cpd[comp][var, wrt]['abs error'][0], 0, decimal=4)
 
 
 if __name__ == "__main__":

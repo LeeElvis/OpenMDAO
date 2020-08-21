@@ -1,6 +1,4 @@
 """Some miscellaneous utility functions."""
-from __future__ import division
-
 from contextlib import contextmanager
 import os
 import re
@@ -9,15 +7,80 @@ import math
 import warnings
 import unittest
 from fnmatch import fnmatchcase
-from six import string_types, PY2, reraise
-from six.moves import range, cStringIO as StringIO
-from collections import Iterable
+from io import StringIO
+
+# note: this is a Python 3.3 change, clean this up for OpenMDAO 3.x
+try:
+    from collections.abc import Iterable
+except ImportError:
+    from collections import Iterable
+
 import numbers
 import json
 import importlib
 
 import numpy as np
 import openmdao
+
+
+# Certain command line tools can make use of this to allow visualization of models when errors
+# are present that would normally cause setup to abort.
+_ignore_errors = False
+
+
+def ignore_errors(flag=None):
+    """
+    Disable certain errors that will prevent setup from completing.
+
+    Parameters
+    ----------
+    flag : bool or None
+        If not None, set the value of _ignore_errors to this value.
+
+    Returns
+    -------
+    bool
+        The current value of _ignore_errors
+    """
+    global _ignore_errors
+    if flag is not None:
+        _ignore_errors = True
+    return _ignore_errors
+
+
+def conditional_error(msg, exc=RuntimeError, category=UserWarning):
+    """
+    Raise an exception or issue a warning, depending on the value of _ignore_errors.
+
+    Parameters
+    ----------
+    msg : str
+        The error/warning message.
+    exc : exception class
+        This exception class is used to create the exception to be raised.
+    category : warning class
+        This category is the class of warning to be issued.
+    """
+    if ignore_errors():
+        simple_warning(msg, category=category)
+    else:
+        raise exc(msg)
+
+
+@contextmanager
+def ignore_errors_context(flag=True):
+    """
+    Set ignore_errors to the given flag in this context.
+
+    Parameters
+    ----------
+    flag : bool
+        If not None, set ignore_errors to this value.
+    """
+    save = ignore_errors()
+    ignore_errors(flag)
+    yield
+    ignore_errors(save)
 
 
 def warn_deprecation(msg):
@@ -183,7 +246,10 @@ def ensure_compatible(name, value, shape=None, indices=None):
 
     if indices is not None:
         indices = np.atleast_1d(indices)
+        contains_slicer = _is_slicer_op(indices)
         ind_shape = indices.shape
+    else:
+        contains_slicer = None
 
     # if shape is not given, infer from value (if not scalar) or indices
     if shape is not None:
@@ -218,8 +284,7 @@ def ensure_compatible(name, value, shape=None, indices=None):
                                  "Expected %s but got %s." %
                                  (name, shape, value.shape))
 
-    # finally make sure shape of indices is compatible
-    if indices is not None and shape != ind_shape[:len(shape)]:
+    if indices is not None and shape != ind_shape[:len(shape)] and not contains_slicer:
         raise ValueError("Shape of indices does not match shape for '%s': "
                          "Expected %s but got %s." %
                          (name, shape, ind_shape[:len(shape)]))
@@ -360,7 +425,7 @@ def format_as_float_or_array(name, values, val_if_none=0.0, flatten=False):
     Format array option values.
 
     Checks that the given array values are either None, float, or an iterable
-    of numeric values. On output all interables of numeric values are
+    of numeric values. On output all iterables of numeric values are
     converted to a flat np.ndarray. If values is scalar, it is converted
     to float.
 
@@ -391,7 +456,7 @@ def format_as_float_or_array(name, values, val_if_none=0.0, flatten=False):
     if isinstance(values, np.ndarray):
         if flatten:
             values = values.flatten()
-    elif not isinstance(values, string_types) \
+    elif not isinstance(values, str) \
             and isinstance(values, Iterable):
         values = np.asarray(values, dtype=float)
         if flatten:
@@ -437,6 +502,8 @@ def all_ancestors(pathname, delim='.'):
     """
     Return a generator of pathnames of the starting object and all of its parents.
 
+    Pathnames are ordered from longest to shortest.
+
     Parameters
     ----------
     pathname : str
@@ -445,8 +512,7 @@ def all_ancestors(pathname, delim='.'):
         Delimiter used to split the name
     """
     parts = pathname.split(delim)
-    yield parts[0]
-    for i in range(2, len(parts) + 1):
+    for i in range(len(parts), 0, -1):
         yield delim.join(parts[:i])
 
 
@@ -530,10 +596,9 @@ def run_model(prob, ignore_exception=False):
     sys.stdout = strout
     try:
         prob.run_model()
-    except Exception:
+    except Exception as err:
         if not ignore_exception:
-            exc = sys.exc_info()
-            reraise(*exc)
+            raise err
     finally:
         sys.stdout = stdout
 
@@ -684,10 +749,7 @@ def json_load_byteified(file_handle):
     data item or structure
         data item or structure with unicode converted to bytes
     """
-    if PY2:
-        return _byteify(json.load(file_handle, object_hook=_byteify), ignore_dicts=True)
-    else:
-        return json.load(file_handle)
+    return json.load(file_handle)
 
 
 def json_loads_byteified(json_str):
@@ -706,18 +768,42 @@ def json_loads_byteified(json_str):
     data item or structure
         data item or structure with unicode converted to bytes
     """
-    if PY2:
-        return _byteify(json.loads(json_str, object_hook=_byteify), ignore_dicts=True)
-    else:
-        return json.loads(json_str)
+    return json.loads(json_str)
+
+
+def remove_whitespace(s, right=False, left=False):
+    """
+    Remove white-space characters from the given string.
+
+    If neither right nor left is specified (the default),
+    then all white-space is removed.
+
+    Parameters
+    ----------
+    s : str
+        The string to be modified.
+    right : bool
+        If True, remove white-space from the end of the string.
+    left : bool
+        If True, remove white-space from the beginning of the string.
+
+    Returns
+    -------
+    str
+        The string with white-space removed.
+    """
+    if not left and not right:
+        return re.sub(r"\s+", "", s, flags=re.UNICODE)
+    elif right and left:
+        return re.sub(r"^\s+|\s+$", "", s, flags=re.UNICODE)
+    elif right:
+        return re.sub(r"\s+$", "", s, flags=re.UNICODE)
+    else:  # left
+        return re.sub(r"^\s+", "", s, flags=re.UNICODE)
 
 
 _badtab = r'`~@#$%^&*()[]{}-+=|\/?<>,.:;'
-if PY2:
-    import string
-    _transtab = string.maketrans(_badtab, '_' * len(_badtab))
-else:
-    _transtab = str.maketrans(_badtab, '_' * len(_badtab))
+_transtab = str.maketrans(_badtab, '_' * len(_badtab))
 
 
 def str2valid_python_name(s):
@@ -744,6 +830,8 @@ def make_serializable(o):
     """
     Recursively convert numpy types to native types for JSON serialization.
 
+    This function should NOT be passed into json.dump or json.dumps as the 'default' arg.
+
     Parameters
     ----------
     o : object
@@ -756,11 +844,271 @@ def make_serializable(o):
     """
     if isinstance(o, _container_classes):
         return [make_serializable(item) for item in o]
+    elif isinstance(o, np.ndarray):
+        return o.tolist()
     elif isinstance(o, np.number):
         return o.item()
-    elif isinstance(o, np.ndarray):
-        return make_serializable(o.tolist())
     elif hasattr(o, '__dict__'):
-        return make_serializable(o.__class__.__name__)
+        return o.__class__.__name__
     else:
         return o
+
+
+def default_noraise(o):
+    """
+    Try to convert some extra types during JSON serialization.
+
+    This is intended to be passed to json.dump or json.dumps as the 'default' arg.  It will
+    attempt to convert values if possible, but if no conversion works, will return
+    'unserializable object (<type>)' instead of raising a TypeError.
+
+    Parameters
+    ----------
+    o : object
+        the object to be converted
+
+    Returns
+    -------
+    object
+        The converted object.
+    """
+    if isinstance(o, _container_classes):
+        return [make_serializable(item) for item in o]
+    elif isinstance(o, np.ndarray):
+        return o.tolist()
+    elif isinstance(o, np.number):
+        return o.item()
+    elif hasattr(o, '__dict__'):
+        return o.__class__.__name__
+    else:
+        return f"unserializable object ({type(o).__name__})"
+
+
+def make_set(str_data, name=None):
+    """
+    Construct a set containing the specified character strings.
+
+    Parameters
+    ----------
+    str_data : None, str, or list of strs
+        Character string(s) to be included in the set.
+
+    name : str, optional
+        A name to be used in error messages.
+
+    Returns
+    -------
+    set
+        A set of character strings.
+    """
+    if not str_data:
+        return set()
+    elif isinstance(str_data, str):
+        return {str_data}
+    elif isinstance(str_data, set):
+        return str_data
+    elif isinstance(str_data, list):
+        return set(str_data)
+    elif name:
+        raise TypeError("The {} argument should be str, set, or list: {}".format(name, str_data))
+    else:
+        raise TypeError("The argument should be str, set, or list: {}".format(str_data))
+
+
+def match_includes_excludes(name, includes=None, excludes=None):
+    """
+    Check to see if the variable names pass through the includes and excludes filter.
+
+    Parameters
+    ----------
+    name : str
+        Name to be checked for match.
+    includes : iter of str or None
+        Glob patterns for name to include in the filtering.  None, the default, means
+        include all.
+    excludes : iter of str or None
+        Glob patterns for name to exclude in the filtering.
+
+    Returns
+    -------
+    bool
+        Return True if the name passes through the filtering of includes and excludes.
+    """
+    # Process excludes
+    if excludes is not None:
+        for pattern in excludes:
+            if fnmatchcase(name, pattern):
+                return False
+
+    # Process includes
+    if includes is None:
+        return True
+    else:
+        for pattern in includes:
+            if fnmatchcase(name, pattern):
+                return True
+
+    return False
+
+
+def match_prom_or_abs(name, prom_name, includes=None, excludes=None):
+    """
+    Check to see if the variable names pass through the includes and excludes filter.
+
+    Parameters
+    ----------
+    name : str
+        Unpromoted variable name to be checked for match.
+    prom_name : str
+        Promoted variable name to be checked for match.
+    includes : iter of str or None
+        Glob patterns for name to include in the filtering.  None, the default, means
+        to include all.
+    excludes : iter of str or None
+        Glob patterns for name to exclude in the filtering.
+
+    Returns
+    -------
+    bool
+        Return True if the name passes through the filtering of includes and excludes.
+    """
+    diff = name != prom_name
+
+    # Process excludes
+    if excludes is not None:
+        for pattern in excludes:
+            if fnmatchcase(name, pattern) or (diff and fnmatchcase(prom_name, pattern)):
+                return False
+
+    # Process includes
+    if includes is None:
+        return True
+    else:
+        for pattern in includes:
+            if fnmatchcase(name, pattern) or (diff and fnmatchcase(prom_name, pattern)):
+                return True
+
+    return False
+
+
+def env_truthy(env_var):
+    """
+    Return True if the given environment variable is 'truthy'.
+
+    Parameters
+    ----------
+    env_var : str
+        The name of the environment variable.
+
+    Returns
+    -------
+    bool
+        True if the specified environment variable is 'truthy'.
+    """
+    return os.environ.get(env_var, '0').lower() not in ('0', 'false', 'no', '')
+
+
+def common_subpath(pathnames):
+    """
+    Return the common dotted subpath found in all of the given dotted pathnames.
+
+    Parameters
+    ----------
+    pathnames : iter of str
+        Dotted pathnames of systems.
+
+    Returns
+    -------
+    str
+        Common dotted subpath.  Returns '' if no common subpath is found.
+    """
+    if len(pathnames) == 1:
+        return pathnames[0]
+
+    if pathnames:
+        npaths = len(pathnames)
+        splits = [p.split('.') for p in pathnames]
+        minlen = np.min([len(s) for s in splits])
+        for common_loc in range(minlen):
+            p0 = splits[0][common_loc]
+            for i in range(1, npaths):
+                if p0 != splits[i][common_loc]:
+                    break
+            else:
+                continue
+            break
+        else:
+            common_loc += 1
+
+        return '.'.join(splits[0][:common_loc])
+
+    return ''
+
+
+def _is_slicer_op(indices):
+    """
+    Check if an array of indices contains a colon or ellipsis operator.
+
+    Parameters
+    ----------
+    indices : ndarray
+        Indices to check.
+
+    Returns
+    -------
+    bool
+        Returns True if indices contains a colon or ellipsis operator.
+    """
+    if isinstance(indices, Iterable):
+        if isinstance(indices, (tuple, list, range, str)):
+            return any(isinstance(i, slice) or i is ... for i in indices)
+        else:
+            return any(isinstance(i, slice) or i is ... for i in indices.flatten())
+    else:
+        return isinstance(indices, slice)
+
+
+def _slice_indices(slicer, out_size, out_shape):
+    """
+    Check if an array of indices contains a slice object.
+
+    Parameters
+    ----------
+    slicer : slice
+        Slice object to slice array
+    out_size : int
+        Size of output array
+    out_shape : tuple
+        Tuple of output array shape
+
+    Returns
+    -------
+    array
+        Returns the sliced indices.
+    """
+    return np.arange(out_size, dtype=int).reshape(out_shape)[tuple(slicer)]
+
+
+def prom2ivc_src_dict(prom_dict):
+    """
+    Convert a dictionary with promoted input names into one with ivc source names.
+
+    Parameters
+    ----------
+    prom_dict : dict
+        Original dict with some promoted paths.
+
+    Returns
+    -------
+    dict
+        New dict with ivc source pathnames.
+    """
+    src_dict = {}
+    for name, meta in prom_dict.items():
+        if meta['ivc_source'] is not None:
+            src_name = meta['ivc_source']
+            src_dict[src_name] = meta
+        else:
+            src_dict[name] = meta
+
+    return src_dict

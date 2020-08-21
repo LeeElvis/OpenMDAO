@@ -1,12 +1,23 @@
 """Test the parallel groups."""
 
-from __future__ import division, print_function
-
 import unittest
+import itertools
+
+# note: this is a Python 3.3 change, clean this up for OpenMDAO 3.x
+try:
+    from collections.abc import Iterable
+except ImportError:
+    from collections import Iterable
+
 import numpy as np
 
 import openmdao.api as om
 from openmdao.utils.mpi import MPI
+
+try:
+    from parameterized import parameterized
+except ImportError:
+    from openmdao.utils.assert_utils import SkipParameterized as parameterized
 
 try:
     from openmdao.vectors.petsc_vector import PETScVector
@@ -16,7 +27,7 @@ except ImportError:
 from openmdao.test_suite.groups.parallel_groups import \
     FanOutGrouped, FanInGrouped2, Diamond, ConvergeDiverge
 
-from openmdao.utils.assert_utils import assert_rel_error
+from openmdao.utils.assert_utils import assert_near_equal
 from openmdao.utils.logger_utils import TestLogger
 from openmdao.error_checking.check_config import _default_checks
 
@@ -29,70 +40,110 @@ class Noisy(ConvergeDiverge):
         logger.info(msg)
 
 
+def _test_func_name(func, num, param):
+    args = []
+    for p in param.args:
+        if not isinstance(p, Iterable):
+            p = {p}
+        for item in p:
+            try:
+                arg = item.__name__
+            except:
+                arg = str(item)
+            args.append(arg)
+    return func.__name__ + '_' + '_'.join(args)
+
+
 @unittest.skipUnless(MPI and PETScVector, "MPI and PETSc are required.")
 class TestParallelGroups(unittest.TestCase):
 
     N_PROCS = 2
 
-    def test_fan_out_grouped(self):
+    @parameterized.expand(itertools.product([(om.LinearRunOnce, None)],
+                                            [om.NonlinearBlockGS, om.NonlinearRunOnce]),
+                          name_func=_test_func_name)
+    def test_fan_out_grouped(self, solv_tup, nlsolver):
         prob = om.Problem(FanOutGrouped())
 
         of=['c2.y', "c3.y"]
         wrt=['iv.x']
 
+        solver, jactype = solv_tup
+
+        prob.model.linear_solver = solver()
+        if jactype is not None:
+            prob.model.options['assembled_jac_type'] = jactype
+        prob.model.nonlinear_solver = nlsolver()
+
         prob.setup(check=False, mode='fwd')
         prob.set_solver_print(level=0)
         prob.run_model()
 
         J = prob.compute_totals(of=['c2.y', "c3.y"], wrt=['iv.x'])
 
-        assert_rel_error(self, J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
-        assert_rel_error(self, J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
+        assert_near_equal(J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
 
-        assert_rel_error(self, prob['c2.y'], -6.0, 1e-6)
-        assert_rel_error(self, prob['c3.y'], 15.0, 1e-6)
+        assert_near_equal(prob['c2.y'], -6.0, 1e-6)
+        assert_near_equal(prob['c3.y'], 15.0, 1e-6)
 
         prob.setup(check=False, mode='rev')
         prob.run_model()
 
         J = prob.compute_totals(of=['c2.y', "c3.y"], wrt=['iv.x'])
 
-        assert_rel_error(self, J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
-        assert_rel_error(self, J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
+        assert_near_equal(J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
 
-        assert_rel_error(self, prob['c2.y'], -6.0, 1e-6)
-        assert_rel_error(self, prob['c3.y'], 15.0, 1e-6)
+        assert_near_equal(prob['c2.y'], -6.0, 1e-6)
+        assert_near_equal(prob['c3.y'], 15.0, 1e-6)
 
-    def test_fan_in_grouped(self):
+    @parameterized.expand(itertools.product([om.LinearRunOnce],
+                                            [om.NonlinearBlockGS, om.NonlinearRunOnce]),
+                          name_func=_test_func_name)
+    def test_fan_in_grouped(self, solver, nlsolver):
 
         prob = om.Problem()
         prob.model = FanInGrouped2()
+
+        prob.model.linear_solver = solver()
+        prob.model.nonlinear_solver = nlsolver()
+
         prob.setup(check=False, mode='fwd')
         prob.set_solver_print(level=0)
         prob.run_model()
-
 
         indep_list = ['p1.x', 'p2.x']
         unknown_list = ['c3.y']
 
-        assert_rel_error(self, prob['c3.y'], 29.0, 1e-6)
+        assert_near_equal(prob['c3.y'], 29.0, 1e-6)
 
         J = prob.compute_totals(of=unknown_list, wrt=indep_list)
-        assert_rel_error(self, J['c3.y', 'p1.x'][0][0], -6.0, 1e-6)
-        assert_rel_error(self, J['c3.y', 'p2.x'][0][0], 35.0, 1e-6)
+        assert_near_equal(J['c3.y', 'p1.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'p2.x'][0][0], 35.0, 1e-6)
 
-        assert_rel_error(self, prob['c3.y'], 29.0, 1e-6)
+        # do this a second time to test caching of dist rows/cols
+        J = prob.compute_totals(of=unknown_list, wrt=indep_list)
+        assert_near_equal(J['c3.y', 'p1.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'p2.x'][0][0], 35.0, 1e-6)
+
+        assert_near_equal(prob['c3.y'], 29.0, 1e-6)
 
         prob.setup(check=False, mode='rev')
         prob.run_model()
 
-        assert_rel_error(self, prob['c3.y'], 29.0, 1e-6)
+        assert_near_equal(prob['c3.y'], 29.0, 1e-6)
 
         J = prob.compute_totals(of=unknown_list, wrt=indep_list)
-        assert_rel_error(self, J['c3.y', 'p1.x'][0][0], -6.0, 1e-6)
-        assert_rel_error(self, J['c3.y', 'p2.x'][0][0], 35.0, 1e-6)
+        assert_near_equal(J['c3.y', 'p1.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'p2.x'][0][0], 35.0, 1e-6)
 
-        assert_rel_error(self, prob['c3.y'], 29.0, 1e-6)
+        # do this a second time to test caching of dist rows/cols
+        J = prob.compute_totals(of=unknown_list, wrt=indep_list)
+        assert_near_equal(J['c3.y', 'p1.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'p2.x'][0][0], 35.0, 1e-6)
+
+        assert_near_equal(prob['c3.y'], 29.0, 1e-6)
 
     def test_fan_in_grouped_feature(self):
 
@@ -101,10 +152,9 @@ class TestParallelGroups(unittest.TestCase):
         prob = om.Problem()
         model = prob.model
 
-        model.add_subsystem('p1', om.IndepVarComp('x', 1.0))
-        model.add_subsystem('p2', om.IndepVarComp('x', 1.0))
+        model.set_input_defaults('x', 1.)
 
-        parallel = model.add_subsystem('parallel', om.ParallelGroup())
+        parallel = model.add_subsystem('parallel', om.ParallelGroup(), promotes_inputs=[('c1.x', 'x'), ('c2.x', 'x')])
         parallel.add_subsystem('c1', om.ExecComp(['y=-2.0*x']))
         parallel.add_subsystem('c2', om.ExecComp(['y=5.0*x']))
 
@@ -113,67 +163,78 @@ class TestParallelGroups(unittest.TestCase):
         model.connect("parallel.c1.y", "c3.x1")
         model.connect("parallel.c2.y", "c3.x2")
 
-        model.connect("p1.x", "parallel.c1.x")
-        model.connect("p2.x", "parallel.c2.x")
-
         prob.setup(check=False, mode='fwd')
         prob.run_model()
 
-        assert_rel_error(self, prob['c3.y'], 29.0, 1e-6)
+        assert_near_equal(prob['c3.y'], 29.0, 1e-6)
 
-    def test_diamond(self):
+    @parameterized.expand(itertools.product([om.LinearRunOnce],
+                                            [om.NonlinearBlockGS, om.NonlinearRunOnce]),
+                          name_func=_test_func_name)
+    def test_diamond(self, solver, nlsolver):
 
         prob = om.Problem()
         prob.model = Diamond()
+
+        prob.model.linear_solver = solver()
+        prob.model.nonlinear_solver = nlsolver()
+
         prob.setup(check=False, mode='fwd')
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['c4.y1'], 46.0, 1e-6)
-        assert_rel_error(self, prob['c4.y2'], -93.0, 1e-6)
+        assert_near_equal(prob['c4.y1'], 46.0, 1e-6)
+        assert_near_equal(prob['c4.y2'], -93.0, 1e-6)
 
         indep_list = ['iv.x']
         unknown_list = ['c4.y1', 'c4.y2']
 
         J = prob.compute_totals(of=unknown_list, wrt=indep_list)
-        assert_rel_error(self, J['c4.y1', 'iv.x'][0][0], 25, 1e-6)
-        assert_rel_error(self, J['c4.y2', 'iv.x'][0][0], -40.5, 1e-6)
+        assert_near_equal(J['c4.y1', 'iv.x'][0][0], 25, 1e-6)
+        assert_near_equal(J['c4.y2', 'iv.x'][0][0], -40.5, 1e-6)
 
         prob.setup(check=False, mode='rev')
         prob.run_model()
 
-        assert_rel_error(self, prob['c4.y1'], 46.0, 1e-6)
-        assert_rel_error(self, prob['c4.y2'], -93.0, 1e-6)
+        assert_near_equal(prob['c4.y1'], 46.0, 1e-6)
+        assert_near_equal(prob['c4.y2'], -93.0, 1e-6)
 
         J = prob.compute_totals(of=unknown_list, wrt=indep_list)
-        assert_rel_error(self, J['c4.y1', 'iv.x'][0][0], 25, 1e-6)
-        assert_rel_error(self, J['c4.y2', 'iv.x'][0][0], -40.5, 1e-6)
+        assert_near_equal(J['c4.y1', 'iv.x'][0][0], 25, 1e-6)
+        assert_near_equal(J['c4.y2', 'iv.x'][0][0], -40.5, 1e-6)
 
-    def test_converge_diverge(self):
+    @parameterized.expand(itertools.product([om.LinearRunOnce],
+                                            [om.NonlinearBlockGS, om.NonlinearRunOnce]),
+                          name_func=_test_func_name)
+    def test_converge_diverge(self, solver, nlsolver):
 
         prob = om.Problem()
         prob.model = ConvergeDiverge()
+
+        prob.model.linear_solver = solver()
+        prob.model.nonlinear_solver = nlsolver()
+
         prob.setup(check=False, mode='fwd')
         prob.set_solver_print(level=0)
         prob.run_model()
 
-        assert_rel_error(self, prob['c7.y1'], -102.7, 1e-6)
+        assert_near_equal(prob['c7.y1'], -102.7, 1e-6)
 
         indep_list = ['iv.x']
         unknown_list = ['c7.y1']
 
         J = prob.compute_totals(of=unknown_list, wrt=indep_list)
-        assert_rel_error(self, J['c7.y1', 'iv.x'][0][0], -40.75, 1e-6)
+        assert_near_equal(J['c7.y1', 'iv.x'][0][0], -40.75, 1e-6)
 
         prob.setup(check=False, mode='rev')
         prob.run_model()
 
-        assert_rel_error(self, prob['c7.y1'], -102.7, 1e-6)
+        assert_near_equal(prob['c7.y1'], -102.7, 1e-6)
 
         J = prob.compute_totals(of=unknown_list, wrt=indep_list)
-        assert_rel_error(self, J['c7.y1', 'iv.x'][0][0], -40.75, 1e-6)
+        assert_near_equal(J['c7.y1', 'iv.x'][0][0], -40.75, 1e-6)
 
-        assert_rel_error(self, prob['c7.y1'], -102.7, 1e-6)
+        assert_near_equal(prob['c7.y1'], -102.7, 1e-6)
 
     def test_zero_shape(self):
         raise unittest.SkipTest("zero shapes not fully supported yet")
@@ -226,22 +287,22 @@ class TestParallelGroups(unittest.TestCase):
 
         J = prob.compute_totals(of=['c2.y', "c3.y"], wrt=['iv.x'])
 
-        assert_rel_error(self, J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
-        assert_rel_error(self, J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
+        assert_near_equal(J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
 
-        assert_rel_error(self, prob['c2.y'], -6.0, 1e-6)
-        assert_rel_error(self, prob['c3.y'], 15.0, 1e-6)
+        assert_near_equal(prob['c2.y'], -6.0, 1e-6)
+        assert_near_equal(prob['c3.y'], 15.0, 1e-6)
 
         prob.setup(check=False, mode='rev')
         prob.run_model()
 
         J = prob.compute_totals(of=['c2.y', "c3.y"], wrt=['iv.x'])
 
-        assert_rel_error(self, J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
-        assert_rel_error(self, J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
+        assert_near_equal(J['c2.y', 'iv.x'][0][0], -6.0, 1e-6)
+        assert_near_equal(J['c3.y', 'iv.x'][0][0], 15.0, 1e-6)
 
-        assert_rel_error(self, prob['c2.y'], -6.0, 1e-6)
-        assert_rel_error(self, prob['c3.y'], 15.0, 1e-6)
+        assert_near_equal(prob['c2.y'], -6.0, 1e-6)
+        assert_near_equal(prob['c3.y'], 15.0, 1e-6)
 
     def test_setup_messages_bad_vec_type(self):
 
@@ -249,7 +310,7 @@ class TestParallelGroups(unittest.TestCase):
 
         # check that error is thrown if not using PETScVector
         if MPI:
-            msg = ("The `distributed_vector_class` argument must be `PETScVector` when "
+            msg = ("Problem: The `distributed_vector_class` argument must be `PETScVector` when "
                    "running in parallel under MPI but 'DefaultVector' was specified.")
             with self.assertRaises(ValueError) as cm:
                 prob.setup(check=False, mode='fwd', distributed_vector_class=om.DefaultVector)
@@ -310,14 +371,16 @@ class TestParallelListStates(unittest.TestCase):
             def solve_nonlinear(self, inputs, outputs):
                 outputs['x'] = np.linalg.solve(self.mtx, inputs['rhs'])
 
-        p = om.Problem(model=om.ParallelGroup())
-        p.model.add_subsystem('C1', StateComp())
-        p.model.add_subsystem('C2', StateComp())
-        p.model.add_subsystem('C3', om.ExecComp('y=2.0*x'))
-        p.model.add_subsystem('C4', StateComp())
+        p = om.Problem()
+        par = p.model.add_subsystem('par', om.ParallelGroup())
+        par.add_subsystem('C1', StateComp())
+        par.add_subsystem('C2', StateComp())
+        par.add_subsystem('C3', om.ExecComp('y=2.0*x'))
+        par.add_subsystem('C4', StateComp())
+
         p.setup()
         p.final_setup()
-        self.assertEqual(sorted(p.model._list_states_allprocs()), ['C1.x', 'C2.x', 'C4.x'])
+        self.assertEqual(sorted(p.model._list_states_allprocs()), ['par.C1.x', 'par.C2.x', 'par.C4.x'])
 
 
 @unittest.skipUnless(MPI and PETScVector, "MPI and PETSc are required.")
@@ -338,6 +401,7 @@ class MatMatParDevTestCase(unittest.TestCase):
         par.add_objective('C2.y')
         par.add_constraint('C1.y', lower=0.0)
         p.setup(mode='fwd')
+
         p.run_model()
 
         # prior to bug fix, this would raise an exception
@@ -346,6 +410,60 @@ class MatMatParDevTestCase(unittest.TestCase):
         np.testing.assert_array_equal(J['par.C2.y', 'indeps.x'], np.zeros((1,2)))
         np.testing.assert_array_equal(J['par.C1.y', 'indeps.y'], np.zeros((2,1)))
         np.testing.assert_array_equal(J['par.C2.y', 'indeps.y'], np.array([[3.]]))
+
+
+class ExComp(om.ExplicitComponent):
+    def initialize(self):
+        self.options.declare('num_nodes', types=int)
+
+    def setup(self):
+        nn = self.options['num_nodes']
+        # Inputs
+        self.add_input('accel', val=np.zeros(nn))
+        self.add_output('deltav_dot', val=np.zeros(nn))
+        # Setup partials
+        ar = np.arange(self.options['num_nodes'])
+        self.declare_partials(of='deltav_dot', wrt='accel', rows=ar, cols=ar, val=1.0)
+
+    def compute(self, inputs, outputs):
+        outputs['deltav_dot'] = inputs['accel']
+
+
+class SubGroup(om.Group):
+    def __init__(self, size, **kwargs):
+        super(SubGroup, self).__init__(**kwargs)
+        self.size = size
+
+    def setup(self):
+        ivc = om.IndepVarComp()
+        ivc.add_output('accel', val=np.ones(self.size))
+        self.add_subsystem('rhs', ivc)
+        self.add_subsystem('ode', ExComp(num_nodes=self.size))
+        self.connect('rhs.accel', 'ode.accel')
+        self.add_design_var('rhs.accel', 3.0)
+
+
+@unittest.skipUnless(MPI and PETScVector, "MPI and PETSc are required.")
+class TestParallelJacBug(unittest.TestCase):
+
+    N_PROCS = 2
+
+    def test_par_jac_bug(self):
+
+        p = om.Problem()
+        model = p.model
+        par = model.add_subsystem('par', om.ParallelGroup())
+        par.add_subsystem('p1', SubGroup(1))
+        par.add_subsystem('p2', SubGroup(1))
+        p.setup(mode='rev')
+        p.run_model()
+        J1 = p.driver._compute_totals(of=['par.p1.ode.deltav_dot'], wrt=['par.p1.ode.deltav_dot'],
+                                      return_format='array')
+        Jsave = J1.copy()
+        J2 = p.driver._compute_totals(of=['par.p1.ode.deltav_dot'], wrt=['par.p1.ode.deltav_dot'],
+                                      return_format='array')
+
+        self.assertLess(np.max(np.abs(J2 - Jsave)), 1e-20)
 
 
 if __name__ == "__main__":

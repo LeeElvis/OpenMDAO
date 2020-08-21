@@ -27,6 +27,17 @@ pyOptSparseDriver Options
     pyOptSparseDriver
     options
 
+pyOptSparseDriver Constructor
+-----------------------------
+
+The call signature for the `pyOptSparseDriver` constructor is:
+
+.. automethod:: openmdao.drivers.pyoptsparse_driver.pyOptSparseDriver.__init__
+    :noindex:
+
+Using pyOptSparseDriver
+-----------------------
+
 pyOptSparseDriver has a small number of unified options that can be specified as keyword arguments when
 it is instantiated or by using the "options" dictionary. We have already shown how to set the
 `optimizer` option. Next we see how the `print_results` option can be used to turn on or off the echoing
@@ -73,6 +84,29 @@ Setting a limit on the number of major iterations. Here, we set it to just a few
 
 .. embed-code::
     openmdao.drivers.tests.test_pyoptsparse_driver.TestPyoptSparseSnoptFeature.test_snopt_maxit
+    :layout: interleave
+
+If you have pyoptsparse 1.1 or greater, then you can send the SIGUSR1 signal to a running SNOPT optimization to tell it to
+terminate cleanly. This is useful if an optimization has gotten close enough to an optimum.  How to do this is dependent
+on your operating system in all cases, on your mpi implementation if you are running mpi, and on your queuing software if
+you are on a supercomputing cluster. Here is a simple example for unix and mpi.
+
+.. code-block:: none
+
+    ktmoore1$ ps -ef |grep sig
+      502 17955   951   0  4:05PM ttys000    0:00.02 mpirun -n 2 python sig_demo.py
+      502 17956 17955   0  4:05PM ttys000    0:00.03 python sig_demo.py
+      502 17957 17955   0  4:05PM ttys000    0:00.03 python sig_demo.py
+      502 17959 17312   0  4:05PM ttys001    0:00.00 grep sig
+
+    ktmoore1$ kill -SIGUSR1 17955
+
+If SIGUSR1 is already used for something else, or its behavior is not supported on your operating system, mpi implementation,
+or queuing system, then you can choose a different signal by setting the "user_terminate_signal" option and giving it a
+different signal, or None to disable the feature.  Here, we change the signal to SIGUSR2:
+
+.. embed-code::
+    openmdao.drivers.tests.test_pyoptsparse_driver.TestPyoptSparseSnoptFeature.test_signal_set
     :layout: interleave
 
 You can learn more about the available options in the SNOPT_Manual_.

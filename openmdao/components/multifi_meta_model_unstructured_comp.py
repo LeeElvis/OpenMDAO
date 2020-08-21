@@ -1,11 +1,9 @@
 """Define the MultiFiMetaModel class."""
-from six.moves import range
 from itertools import chain
 
 import numpy as np
 
 from openmdao.components.meta_model_unstructured_comp import MetaModelUnStructuredComp
-from openmdao.utils.general_utils import warn_deprecation
 
 
 def _get_name_fi(name, fi_index):
@@ -112,11 +110,27 @@ class MultiFiMetaModelUnStructuredComp(MetaModelUnStructuredComp):
         self.options.declare('nfi', types=int, default=1, lower=1,
                              desc='Number of levels of fidelity.')
 
-    def _setup_procs(self, pathname, comm, mode, prob_options):
+    def _setup_procs(self, pathname, comm, mode, prob_meta):
+        """
+        Execute first phase of the setup process.
+
+        Distribute processors, assign pathnames, and call setup on the component.
+
+        Parameters
+        ----------
+        pathname : str
+            Global name of the system, including the path.
+        comm : MPI.Comm or <FakeComm>
+            MPI communicator object.
+        mode : str
+            Derivatives calculation mode, 'fwd' for forward, and 'rev' for
+            reverse (adjoint).
+        prob_meta : dict
+            Problem level options.
+        """
         self._input_sizes = list(self._static_input_sizes)
 
-        super(MultiFiMetaModelUnStructuredComp, self)._setup_procs(pathname, comm, mode,
-                                                                   prob_options)
+        super(MultiFiMetaModelUnStructuredComp, self)._setup_procs(pathname, comm, mode, prob_meta)
 
     def add_input(self, name, val=1.0, shape=None, src_indices=None, flat_src_indices=None,
                   units=None, desc=''):
@@ -301,45 +315,3 @@ class MultiFiMetaModelUnStructuredComp(MetaModelUnStructuredComp):
 
         self._training_input = inputs
         self.train = False
-
-
-class MultiFiMetaModel(MultiFiMetaModelUnStructuredComp):
-    """
-    Deprecated.
-    """
-
-    def __init__(self, *args, **kwargs):
-        """
-        Capture Initialize to throw warning.
-
-        Parameters
-        ----------
-        *args : list
-            Deprecated arguments.
-        **kwargs : dict
-            Deprecated arguments.
-        """
-        warn_deprecation("'MultiFiMetaModel' component has been deprecated. Use "
-                         "'MultiFiMetaModelUnStructuredComp' instead.")
-        super(MultiFiMetaModel, self).__init__(*args, **kwargs)
-
-
-class MultiFiMetaModelUnStructured(MultiFiMetaModelUnStructuredComp):
-    """
-    Deprecated.
-    """
-
-    def __init__(self, *args, **kwargs):
-        """
-        Capture Initialize to throw warning.
-
-        Parameters
-        ----------
-        *args : list
-            Deprecated arguments.
-        **kwargs : dict
-            Deprecated arguments.
-        """
-        warn_deprecation("'MultiFiMetaModelUnStructured' has been deprecated. Use "
-                         "'MultiFiMetaModelUnStructuredComp' instead.")
-        super(MultiFiMetaModelUnStructured, self).__init__(*args, **kwargs)

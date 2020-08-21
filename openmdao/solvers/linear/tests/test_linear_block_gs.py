@@ -1,6 +1,5 @@
 """Test the LinearBlockGS linear solver class."""
 
-from __future__ import division, print_function
 import unittest
 
 import numpy as np
@@ -11,7 +10,7 @@ from openmdao.test_suite.components.sellar import SellarImplicitDis1, SellarImpl
     SellarDis1withDerivatives, SellarDis2withDerivatives
 from openmdao.test_suite.components.expl_comp_simple import TestExplCompSimpleDense
 from openmdao.test_suite.components.sellar import SellarDerivatives
-from openmdao.utils.assert_utils import assert_rel_error
+from openmdao.utils.assert_utils import assert_near_equal
 
 
 class SimpleImp(om.ImplicitComponent):
@@ -78,7 +77,7 @@ class TestBGSSolver(LinearSolverTests.LinearSolverTestCase):
         model.connect('d1.y1', 'd2.y1')
         model.connect('d2.y2', 'd1.y2')
 
-        model.nonlinear_solver = om.NewtonSolver()
+        model.nonlinear_solver = om.NewtonSolver(solve_subsystems=False)
         model.nonlinear_solver.options['maxiter'] = 5
         model.linear_solver = self.linear_solver_class()
 
@@ -101,7 +100,7 @@ class TestBGSSolver(LinearSolverTests.LinearSolverTestCase):
         model.connect('d1.y1', 'd2.y1')
         model.connect('d2.y2', 'd1.y2')
 
-        model.nonlinear_solver = om.NewtonSolver()
+        model.nonlinear_solver = om.NewtonSolver(solve_subsystems=False)
         model.nonlinear_solver.options['maxiter'] = 5
         model.nonlinear_solver.linesearch = om.BoundsEnforceLS()
         model.linear_solver = om.ScipyKrylov()
@@ -138,7 +137,7 @@ class TestBGSSolver(LinearSolverTests.LinearSolverTestCase):
 
         derivs = prob.compute_totals(of=['sub.z'], wrt=['sub.z'])
 
-        assert_rel_error(self, derivs[('sub.z', 'sub.z')], [[0., 1.]])
+        assert_near_equal(derivs[('sub.z', 'sub.z')], [[0., 1.]])
 
 
 class TestBGSSolverFeature(unittest.TestCase):
@@ -151,9 +150,6 @@ class TestBGSSolverFeature(unittest.TestCase):
 
         prob = om.Problem()
         model = prob.model
-
-        model.add_subsystem('px', om.IndepVarComp('x', 1.0), promotes=['x'])
-        model.add_subsystem('pz', om.IndepVarComp('z', np.array([5.0, 2.0])), promotes=['z'])
 
         model.add_subsystem('d1', SellarDis1withDerivatives(), promotes=['x', 'z', 'y1', 'y2'])
         model.add_subsystem('d2', SellarDis2withDerivatives(), promotes=['z', 'y1', 'y2'])
@@ -169,14 +165,18 @@ class TestBGSSolverFeature(unittest.TestCase):
         model.nonlinear_solver = om.NonlinearBlockGS()
 
         prob.setup()
+
+        prob.set_val('x', 1.)
+        prob.set_val('z', np.array([5.0, 2.0]))
+
         prob.run_model()
 
         wrt = ['z']
         of = ['obj']
 
         J = prob.compute_totals(of=of, wrt=wrt, return_format='flat_dict')
-        assert_rel_error(self, J['obj', 'z'][0][0], 9.61001056, .00001)
-        assert_rel_error(self, J['obj', 'z'][0][1], 1.78448534, .00001)
+        assert_near_equal(J['obj', 'z'][0][0], 9.61001056, .00001)
+        assert_near_equal(J['obj', 'z'][0][1], 1.78448534, .00001)
 
     def test_feature_maxiter(self):
         import numpy as np
@@ -186,9 +186,6 @@ class TestBGSSolverFeature(unittest.TestCase):
 
         prob = om.Problem()
         model = prob.model
-
-        model.add_subsystem('px', om.IndepVarComp('x', 1.0), promotes=['x'])
-        model.add_subsystem('pz', om.IndepVarComp('z', np.array([5.0, 2.0])), promotes=['z'])
 
         model.add_subsystem('d1', SellarDis1withDerivatives(), promotes=['x', 'z', 'y1', 'y2'])
         model.add_subsystem('d2', SellarDis2withDerivatives(), promotes=['z', 'y1', 'y2'])
@@ -206,14 +203,18 @@ class TestBGSSolverFeature(unittest.TestCase):
         model.linear_solver.options['maxiter'] = 2
 
         prob.setup()
+
+        prob.set_val('x', 1.)
+        prob.set_val('z', np.array([5.0, 2.0]))
+
         prob.run_model()
 
         wrt = ['z']
         of = ['obj']
 
         J = prob.compute_totals(of=of, wrt=wrt, return_format='flat_dict')
-        assert_rel_error(self, J['obj', 'z'][0][0], 9.60230118004, .00001)
-        assert_rel_error(self, J['obj', 'z'][0][1], 1.78022500547, .00001)
+        assert_near_equal(J['obj', 'z'][0][0], 9.60230118004, .00001)
+        assert_near_equal(J['obj', 'z'][0][1], 1.78022500547, .00001)
 
     def test_feature_atol(self):
         import numpy as np
@@ -223,9 +224,6 @@ class TestBGSSolverFeature(unittest.TestCase):
 
         prob = om.Problem()
         model = prob.model
-
-        model.add_subsystem('px', om.IndepVarComp('x', 1.0), promotes=['x'])
-        model.add_subsystem('pz', om.IndepVarComp('z', np.array([5.0, 2.0])), promotes=['z'])
 
         model.add_subsystem('d1', SellarDis1withDerivatives(), promotes=['x', 'z', 'y1', 'y2'])
         model.add_subsystem('d2', SellarDis2withDerivatives(), promotes=['z', 'y1', 'y2'])
@@ -243,14 +241,18 @@ class TestBGSSolverFeature(unittest.TestCase):
         model.linear_solver.options['atol'] = 1.0e-3
 
         prob.setup()
+
+        prob.set_val('x', 1.)
+        prob.set_val('z', np.array([5.0, 2.0]))
+
         prob.run_model()
 
         wrt = ['z']
         of = ['obj']
 
         J = prob.compute_totals(of=of, wrt=wrt, return_format='flat_dict')
-        assert_rel_error(self, J['obj', 'z'][0][0], 9.61016296175, .00001)
-        assert_rel_error(self, J['obj', 'z'][0][1], 1.78456955704, .00001)
+        assert_near_equal(J['obj', 'z'][0][0], 9.61016296175, .00001)
+        assert_near_equal(J['obj', 'z'][0][1], 1.78456955704, .00001)
 
     def test_feature_rtol(self):
         import numpy as np
@@ -260,9 +262,6 @@ class TestBGSSolverFeature(unittest.TestCase):
 
         prob = om.Problem()
         model = prob.model
-
-        model.add_subsystem('px', om.IndepVarComp('x', 1.0), promotes=['x'])
-        model.add_subsystem('pz', om.IndepVarComp('z', np.array([5.0, 2.0])), promotes=['z'])
 
         model.add_subsystem('d1', SellarDis1withDerivatives(), promotes=['x', 'z', 'y1', 'y2'])
         model.add_subsystem('d2', SellarDis2withDerivatives(), promotes=['z', 'y1', 'y2'])
@@ -280,14 +279,18 @@ class TestBGSSolverFeature(unittest.TestCase):
         model.linear_solver.options['rtol'] = 1.0e-3
 
         prob.setup()
+
+        prob.set_val('x', 1.)
+        prob.set_val('z', np.array([5.0, 2.0]))
+
         prob.run_model()
 
         wrt = ['z']
         of = ['obj']
 
         J = prob.compute_totals(of=of, wrt=wrt, return_format='flat_dict')
-        assert_rel_error(self, J['obj', 'z'][0][0], 9.61016296175, .00001)
-        assert_rel_error(self, J['obj', 'z'][0][1], 1.78456955704, .00001)
+        assert_near_equal(J['obj', 'z'][0][0], 9.61016296175, .00001)
+        assert_near_equal(J['obj', 'z'][0][1], 1.78456955704, .00001)
 
 
 if __name__ == "__main__":

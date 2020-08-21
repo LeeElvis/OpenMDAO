@@ -1,10 +1,7 @@
 """Define the BalanceComp class."""
 
-from __future__ import print_function, division, absolute_import
-
 from types import FunctionType
 from numbers import Number
-from six import iteritems
 
 import numpy as np
 
@@ -27,12 +24,13 @@ class BalanceComp(ImplicitComponent):
         Declare options.
         """
         self.options.declare('guess_func', types=FunctionType, allow_none=True, default=None,
-                             desc='A callable function in the form f(inputs, outputs, residuals) '
-                                  'that can provide an initial "guess" value of the state '
-                                  'variable(s) based on the inputs, outputs and residuals.')
+                             recordable=False, desc='A callable function in the form '
+                             'f(inputs, outputs, residuals) that can provide an initial "guess" '
+                             'value of the state variable(s) based on the inputs, outputs and '
+                             'residuals.')
 
     def __init__(self, name=None, eq_units=None, lhs_name=None, rhs_name=None, rhs_val=0.0,
-                 use_mult=False, mult_name=None, mult_val=1.0, normalize=True, **kwargs):
+                 use_mult=False, mult_name=None, mult_val=1.0, normalize=True, val=None, **kwargs):
         r"""
         Initialize a BalanceComp, optionally creating a new implicit state variable.
 
@@ -70,17 +68,15 @@ class BalanceComp(ImplicitComponent):
             prob = Problem()
             bal = BalanceComp()
             bal.add_balance('x', val=1.0)
-            tgt = IndepVarComp(name='y_tgt', val=2)
             exec_comp = ExecComp('y=x**2')
-            prob.model.add_subsystem(name='target', subsys=tgt, promotes_outputs=['y_tgt'])
             prob.model.add_subsystem(name='exec', subsys=exec_comp)
             prob.model.add_subsystem(name='balance', subsys=bal)
-            prob.model.connect('y_tgt', 'balance.rhs:x')
             prob.model.connect('balance.x', 'exec.x')
             prob.model.connect('exec.y', 'balance.lhs:x')
             prob.model.linear_solver = DirectSolver()
-            prob.model.nonlinear_solver = NewtonSolver()
+            prob.model.nonlinear_solver = NewtonSolver(solve_subsystems=False)
             prob.setup()
+            prob.set_val('exec.x', 2)
             prob.run_model()
 
         The arguments to add_balance can be provided on initialization to provide a balance
@@ -90,17 +86,15 @@ class BalanceComp(ImplicitComponent):
 
             prob = Problem()
             bal = BalanceComp('x', val=1.0)
-            tgt = IndepVarComp(name='y_tgt', val=2)
             exec_comp = ExecComp('y=x**2')
-            prob.model.add_subsystem(name='target', subsys=tgt, promotes_outputs=['y_tgt'])
             prob.model.add_subsystem(name='exec', subsys=exec_comp)
             prob.model.add_subsystem(name='balance', subsys=bal)
-            prob.model.connect('y_tgt', 'balance.rhs:x')
             prob.model.connect('balance.x', 'exec.x')
             prob.model.connect('exec.y', 'balance.lhs:x')
             prob.model.linear_solver = DirectSolver()
-            prob.model.nonlinear_solver = NewtonSolver()
+            prob.model.nonlinear_solver = NewtonSolver(solve_subsystems=False)
             prob.setup()
+            prob.set_val('exec.x', 2)
             prob.run_model()
 
         Parameters
@@ -131,6 +125,8 @@ class BalanceComp(ImplicitComponent):
         normalize : bool
             Specifies whether or not the resulting residual should be normalized by a quadratic
             function of the RHS.
+        val : float, int, or np.ndarray
+            Set initial value for the state.
         **kwargs : dict
             Additional arguments to be passed for the creation of the implicit state variable.
             (see `add_output` method).
@@ -145,44 +141,7 @@ class BalanceComp(ImplicitComponent):
 
         if name is not None:
             self.add_balance(name, eq_units, lhs_name, rhs_name, rhs_val,
-                             use_mult, mult_name, mult_val, normalize, **kwargs)
-
-    def setup(self):
-        """
-        Define the independent variables, output variables, and partials.
-        """
-        for name, options in iteritems(self._state_vars):
-
-            meta = self.add_output(name, **options['kwargs'])
-
-            n = self._state_vars[name]['size'] = meta['size']
-
-            for s in ('lhs', 'rhs', 'mult'):
-                if options['{0}_name'.format(s)] is None:
-                    options['{0}_name'.format(s)] = '{0}:{1}'.format(s, name)
-
-            self.add_input(options['lhs_name'],
-                           val=np.ones(n),
-                           units=options['eq_units'])
-
-            self.add_input(options['rhs_name'],
-                           val=options['rhs_val'] * np.ones(n),
-                           units=options['eq_units'])
-
-            if options['use_mult']:
-                self.add_input(options['mult_name'],
-                               val=options['mult_val'] * np.ones(n),
-                               units=None)
-
-            self._scale_factor = np.ones(n)
-            self._dscale_drhs = np.ones(n)
-
-            ar = np.arange(n)
-            self.declare_partials(of=name, wrt=options['lhs_name'], rows=ar, cols=ar, val=1.0)
-            self.declare_partials(of=name, wrt=options['rhs_name'], rows=ar, cols=ar, val=1.0)
-
-            if options['use_mult']:
-                self.declare_partials(of=name, wrt=options['mult_name'], rows=ar, cols=ar, val=1.0)
+                             use_mult, mult_name, mult_val, normalize, val, **kwargs)
 
     def apply_nonlinear(self, inputs, outputs, residuals):
         """
@@ -202,7 +161,7 @@ class BalanceComp(ImplicitComponent):
         else:
             self._scale_factor = self._scale_factor.real
 
-        for name, options in iteritems(self._state_vars):
+        for name, options in self._state_vars.items():
             lhs = inputs[options['lhs_name']]
             rhs = inputs[options['rhs_name']]
 
@@ -241,7 +200,7 @@ class BalanceComp(ImplicitComponent):
         else:
             self._dscale_drhs = self._dscale_drhs.real
 
-        for name, options in iteritems(self._state_vars):
+        for name, options in self._state_vars.items():
             lhs_name = options['lhs_name']
             rhs_name = options['rhs_name']
 
@@ -268,15 +227,18 @@ class BalanceComp(ImplicitComponent):
                 mult = inputs[mult_name]
 
                 # Partials of residual wrt mult
-                jacobian[name, mult_name] = lhs * self._scale_factor
+                deriv = lhs * self._scale_factor
+                jacobian[name, mult_name] = deriv.flatten()
             else:
                 mult = 1.0
 
             # Partials of residual wrt rhs
-            jacobian[name, rhs_name] = (mult * lhs - rhs) * self._dscale_drhs - self._scale_factor
+            deriv = (mult * lhs - rhs) * self._dscale_drhs - self._scale_factor
+            jacobian[name, rhs_name] = deriv.flatten()
 
             # Partials of residual wrt lhs
-            jacobian[name, lhs_name] = mult * self._scale_factor
+            deriv = mult * self._scale_factor
+            jacobian[name, lhs_name] = deriv.flatten()
 
     def guess_nonlinear(self, inputs, outputs, residuals):
         """
@@ -297,7 +259,8 @@ class BalanceComp(ImplicitComponent):
             self.options['guess_func'](inputs, outputs, residuals)
 
     def add_balance(self, name, eq_units=None, lhs_name=None, rhs_name=None, rhs_val=0.0,
-                    use_mult=False, mult_name=None, mult_val=1.0, normalize=True, **kwargs):
+                    use_mult=False, mult_name=None, mult_val=1.0, normalize=True, val=None,
+                    **kwargs):
         """
         Add a new state variable and associated equation to be balanced.
 
@@ -333,16 +296,60 @@ class BalanceComp(ImplicitComponent):
         normalize : bool
             Specifies whether or not the resulting residual should be normalized by a quadratic
             function of the RHS.
+        val : float, int, or np.ndarray
+            Set initial value for the state.
         **kwargs : dict
             Additional arguments to be passed for the creation of the implicit state variable.
             (see `add_output` method).
         """
-        self._state_vars[name] = {'kwargs': kwargs,
-                                  'eq_units': eq_units,
-                                  'lhs_name': lhs_name,
-                                  'rhs_name': rhs_name,
-                                  'rhs_val': rhs_val,
-                                  'use_mult': use_mult,
-                                  'mult_name': mult_name,
-                                  'mult_val': mult_val,
-                                  'normalize': normalize}
+        options = {'kwargs': kwargs,
+                   'eq_units': eq_units,
+                   'lhs_name': lhs_name,
+                   'rhs_name': rhs_name,
+                   'rhs_val': rhs_val,
+                   'use_mult': use_mult,
+                   'mult_name': mult_name,
+                   'mult_val': mult_val,
+                   'normalize': normalize}
+
+        self._state_vars[name] = options
+
+        if val is None:
+            # If user doesn't specify initial guess for val, we can size problem from initial
+            # rhs_val.
+            if 'shape' not in kwargs and not np.isscalar(rhs_val):
+                kwargs['shape'] = rhs_val.shape
+
+        else:
+            options['kwargs']['val'] = val
+
+        meta = self.add_output(name, **options['kwargs'])
+
+        shape = meta['shape']
+
+        for s in ('lhs', 'rhs', 'mult'):
+            if options['{0}_name'.format(s)] is None:
+                options['{0}_name'.format(s)] = '{0}:{1}'.format(s, name)
+
+        self.add_input(options['lhs_name'],
+                       val=np.ones(shape),
+                       units=options['eq_units'])
+
+        self.add_input(options['rhs_name'],
+                       val=options['rhs_val'] * np.ones(shape),
+                       units=options['eq_units'])
+
+        if options['use_mult']:
+            self.add_input(options['mult_name'],
+                           val=options['mult_val'] * np.ones(shape),
+                           units=None)
+
+        self._scale_factor = np.ones(shape)
+        self._dscale_drhs = np.ones(shape)
+
+        ar = np.arange(np.prod(shape))
+        self.declare_partials(of=name, wrt=options['lhs_name'], rows=ar, cols=ar, val=1.0)
+        self.declare_partials(of=name, wrt=options['rhs_name'], rows=ar, cols=ar, val=1.0)
+
+        if options['use_mult']:
+            self.declare_partials(of=name, wrt=options['mult_name'], rows=ar, cols=ar, val=1.0)

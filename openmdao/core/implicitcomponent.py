@@ -1,10 +1,6 @@
 """Define the ImplicitComponent class."""
 
-from __future__ import division
-
 import numpy as np
-from six import itervalues, iteritems
-from six.moves import range
 
 from openmdao.core.component import Component
 from openmdao.recorders.recording_iteration_stack import Recording
@@ -85,9 +81,6 @@ class ImplicitComponent(Component):
         """
         Compute outputs. The model is assumed to be in a scaled state.
         """
-        # Reconfigure if needed.
-        super(ImplicitComponent, self)._solve_nonlinear()
-
         self._inputs.read_only = True
 
         try:
@@ -109,30 +102,32 @@ class ImplicitComponent(Component):
         """
         Provide initial guess for states.
         """
-        self._inputs.read_only = self._residuals.read_only = True
-        complex_step = self._inputs._under_complex_step
+        if self._has_guess:
+            self._apply_nonlinear()
+            self._inputs.read_only = self._residuals.read_only = True
+            complex_step = self._inputs._under_complex_step
 
-        try:
-            with self._unscaled_context(outputs=[self._outputs], residuals=[self._residuals]):
+            try:
+                with self._unscaled_context(outputs=[self._outputs], residuals=[self._residuals]):
+                    if complex_step:
+                        self._inputs.set_complex_step_mode(False, keep_real=True)
+                        self._outputs.set_complex_step_mode(False, keep_real=True)
+                        self._residuals.set_complex_step_mode(False, keep_real=True)
+                    if self._discrete_inputs or self._discrete_outputs:
+                        self.guess_nonlinear(self._inputs, self._outputs, self._residuals,
+                                             self._discrete_inputs, self._discrete_outputs)
+                    else:
+                        self.guess_nonlinear(self._inputs, self._outputs, self._residuals)
+            finally:
                 if complex_step:
-                    self._inputs.set_complex_step_mode(False, keep_real=True)
-                    self._outputs.set_complex_step_mode(False, keep_real=True)
-                    self._residuals.set_complex_step_mode(False, keep_real=True)
-                if self._discrete_inputs or self._discrete_outputs:
-                    self.guess_nonlinear(self._inputs, self._outputs, self._residuals,
-                                         self._discrete_inputs, self._discrete_outputs)
-                else:
-                    self.guess_nonlinear(self._inputs, self._outputs, self._residuals)
-        finally:
-            if complex_step:
-                # Note: passing in False swaps back to the complex vector, which is valid since
-                # the inputs and residuals value cannot be edited.
-                self._inputs.set_complex_step_mode(False)
-                self._inputs._under_complex_step = True
-                self._outputs.set_complex_step_mode(True)
-                self._residuals.set_complex_step_mode(False)
-                self._residuals._under_complex_step = True
-            self._inputs.read_only = self._residuals.read_only = False
+                    # Note: passing in False swaps back to the complex vector, which is valid since
+                    # the inputs and residuals value cannot be edited.
+                    self._inputs.set_complex_step_mode(False)
+                    self._inputs._under_complex_step = True
+                    self._outputs.set_complex_step_mode(True)
+                    self._residuals.set_complex_step_mode(False)
+                    self._residuals._under_complex_step = True
+                self._inputs.read_only = self._residuals.read_only = False
 
     def _apply_linear(self, jac, vec_names, rel_systems, mode, scope_out=None, scope_in=None):
         """
@@ -259,7 +254,7 @@ class ImplicitComponent(Component):
                         d_outputs.read_only = d_residuals.read_only = False
 
     def _approx_subjac_keys_iter(self):
-        for abs_key, meta in iteritems(self._subjacs_info):
+        for abs_key, meta in self._subjacs_info.items():
             if 'method' in meta:
                 method = meta['method']
                 if method is not None and method in self._approx_schemes:
@@ -281,7 +276,7 @@ class ImplicitComponent(Component):
         with self._unscaled_context(outputs=[self._outputs]):
             # Computing the approximation before the call to compute_partials allows users to
             # override FD'd values.
-            for approximation in itervalues(self._approx_schemes):
+            for approximation in self._approx_schemes.values():
                 approximation.compute_approximations(self, jac=self._jacobian)
 
             self._inputs.read_only = self._outputs.read_only = True
@@ -298,7 +293,8 @@ class ImplicitComponent(Component):
         if (jac is None or jac is self._assembled_jac) and self._assembled_jac is not None:
             self._assembled_jac._update(self)
 
-    def apply_nonlinear(self, inputs, outputs, residuals):
+    def apply_nonlinear(self, inputs, outputs, residuals, discrete_inputs=None,
+                        discrete_outputs=None):
         """
         Compute residuals given inputs and outputs.
 
@@ -312,6 +308,10 @@ class ImplicitComponent(Component):
             unscaled, dimensional output variables read via outputs[key]
         residuals : Vector
             unscaled, dimensional residuals written to via residuals[key]
+        discrete_inputs : dict or None
+            If not None, dict containing discrete input values.
+        discrete_outputs : dict or None
+            If not None, dict containing discrete output values.
         """
         pass
 
@@ -429,13 +429,16 @@ class ImplicitComponent(Component):
         """
         Return list of all states at and below this system.
 
+        If final setup has not been performed yet, return relative names for this system only.
+
         Returns
         -------
         list
             List of all states.
         """
-        return [name for name in self._outputs._names] + \
-               [name for name in self._var_allprocs_discrete['output']]
+        prefix = self.pathname + '.' if self.pathname else ''
+        return sorted(self._var_allprocs_abs_names['output'] +
+                      [prefix + n for n in self._var_discrete['output']])
 
     def _list_states_allprocs(self):
         """

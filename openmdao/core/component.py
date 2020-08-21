@@ -1,41 +1,35 @@
 """Define the Component class."""
 
-from __future__ import division
-
-from collections import OrderedDict, Iterable, Counter, defaultdict
+from collections import OrderedDict, Counter, defaultdict
+from collections.abc import Iterable
 from itertools import product
-from six import string_types, iteritems, itervalues
 
 import numpy as np
 from numpy import ndarray, isscalar, atleast_1d, atleast_2d, promote_types
 from scipy.sparse import issparse
 
-from openmdao.core.system import System, _supported_methods, _DEFAULT_COLORING_META
-from openmdao.approximation_schemes.complex_step import ComplexStep
-from openmdao.approximation_schemes.finite_difference import FiniteDifference
+from openmdao.core.system import System, _supported_methods, _DEFAULT_COLORING_META, \
+    global_meta_names
 from openmdao.jacobians.dictionary_jacobian import DictionaryJacobian
-from openmdao.vectors.vector import INT_DTYPE
+from openmdao.vectors.vector import INT_DTYPE, _full_slice
 from openmdao.utils.units import valid_units
 from openmdao.utils.name_maps import rel_key2abs_key, abs_key2rel_key, rel_name2abs_name
 from openmdao.utils.mpi import MPI
 from openmdao.utils.general_utils import format_as_float_or_array, ensure_compatible, \
-    warn_deprecation, find_matches, simple_warning
+    find_matches, simple_warning, make_set, _is_slicer_op
 import openmdao.utils.coloring as coloring_mod
 
 
-# the following metadata will be accessible for vars on all procs
-global_meta_names = {
-    'input': ('units', 'shape', 'size', 'distributed'),
-    'output': ('units', 'shape', 'size',
-               'ref', 'ref0', 'res_ref', 'distributed', 'lower', 'upper'),
-}
-
-_full_slice = slice(None)
+_forbidden_chars = ['.', '*', '?', '!', '[', ']']
+_whitespace = set([' ', '\t', '\r', '\n'])
 
 
 def _valid_var_name(name):
     """
     Determine if the proposed name is a valid variable name.
+
+    Leading and trailing whitespace is illegal, and a specific list of characters
+    are illegal anywhere in the string.
 
     Parameters
     ----------
@@ -47,9 +41,13 @@ def _valid_var_name(name):
     bool
         True if the proposed name is a valid variable name, else False.
     """
-    forbidden_chars = ['.', '*', '?', '!', '[', ']']
-
-    return not any([True for character in forbidden_chars if character in name])
+    global _forbidden_chars, _whitespace
+    if not name:
+        return False
+    for char in _forbidden_chars:
+        if char in name:
+            return False
+    return name[0] not in _whitespace and name[-1] not in _whitespace
 
 
 class Component(System):
@@ -108,34 +106,6 @@ class Component(System):
                              desc='True if the component has variables that are distributed '
                                   'across multiple processes.')
 
-    @property
-    def distributed(self):
-        """
-        Provide 'distributed' property for backwards compatibility.
-
-        Returns
-        -------
-        bool
-            reference to the 'distributed' option.
-        """
-        warn_deprecation("The 'distributed' property provides backwards compatibility "
-                         "with OpenMDAO <= 2.4.0 ; use the 'distributed' option instead.")
-        return self.options['distributed']
-
-    @distributed.setter
-    def distributed(self, val):
-        """
-        Provide for setting of the 'distributed' property for backwards compatibility.
-
-        Parameters
-        ----------
-        val : bool
-            True if the component has variables that are distributed across multiple processes.
-        """
-        warn_deprecation("The 'distributed' property provides backwards compatibility "
-                         "with OpenMDAO <= 2.4.0 ; use the 'distributed' option instead.")
-        self.options['distributed'] = val
-
     def setup(self):
         """
         Declare inputs and outputs.
@@ -148,7 +118,7 @@ class Component(System):
         """
         pass
 
-    def _setup_procs(self, pathname, comm, mode, prob_options):
+    def _setup_procs(self, pathname, comm, mode, prob_meta):
         """
         Execute first phase of the setup process.
 
@@ -160,17 +130,15 @@ class Component(System):
             Global name of the system, including the path.
         comm : MPI.Comm or <FakeComm>
             MPI communicator object.
-        mode : string
+        mode : str
             Derivatives calculation mode, 'fwd' for forward, and 'rev' for
             reverse (adjoint). Default is 'rev'.
-        prob_options : OptionsDictionary
-            Problem level options.
+        prob_meta : dict
+            Problem level metadata.
         """
-        self.pathname = pathname
-        self._problem_options = prob_options
+        super(Component, self)._setup_procs(pathname, comm, mode, prob_meta)
 
-        self.options._parent_name = self.msginfo
-        self.recording_options._parent_name = self.msginfo
+        self._vectors = {}
 
         orig_comm = comm
         if self._num_par_fd > 1:
@@ -182,22 +150,14 @@ class Component(System):
                 simple_warning(msg)
 
         self.comm = comm
-        self._mode = mode
-        self._subsystems_proc_range = []
-        self._first_call_to_linearize = True
 
         # Clear out old variable information so that we can call setup on the component.
         self._var_rel_names = {'input': [], 'output': []}
         self._var_rel2meta = {}
-        self._design_vars = OrderedDict()
-        self._responses = OrderedDict()
 
-        self._static_mode = False
         self._var_rel2meta.update(self._static_var_rel2meta)
         for type_ in ['input', 'output']:
             self._var_rel_names[type_].extend(self._static_var_rel_names[type_])
-        self._design_vars.update(self._static_design_vars)
-        self._responses.update(self._static_responses)
         self.setup()
 
         # check to make sure that if num_par_fd > 1 that this system is actually doing FD.
@@ -209,11 +169,31 @@ class Component(System):
                                                                 self._approx_schemes):
             raise RuntimeError("%s: num_par_fd is > 1 but no FD is active." % self.msginfo)
 
+        self._set_vector_class()
+
+    def _set_vector_class(self):
+        if self.options['distributed']:
+            dist_vec_class = self._problem_meta['distributed_vector_class']
+            if dist_vec_class is not None:
+                self._vector_class = dist_vec_class
+            else:
+                simple_warning("The 'distributed' option is set to True for Component %s, "
+                               "but there is no distributed vector implementation (MPI/PETSc) "
+                               "available. The default non-distributed vectors will be used."
+                               % self.pathname)
+                self._vector_class = self._problem_meta['local_vector_class']
+        else:
+            self._vector_class = self._problem_meta['local_vector_class']
+
+    def _configure_check(self):
+        """
+        Do any error checking on i/o configuration.
+        """
         # check here if declare_coloring was called during setup but declare_partials
         # wasn't.  If declare partials wasn't called, call it with of='*' and wrt='*' so we'll
         # have something to color.
         if self._coloring_info['coloring'] is not None:
-            for key, meta in iteritems(self._declared_partials):
+            for key, meta in self._declared_partials.items():
                 if 'method' in meta and meta['method'] is not None:
                     break
             else:
@@ -223,34 +203,22 @@ class Component(System):
                                "using default metadata and method='%s'." % (self.msginfo, method))
                 self.declare_partials('*', '*', method=method)
 
-        self._static_mode = True
+        super(Component, self)._configure_check()
 
-        if self.options['distributed']:
-            if self._distributed_vector_class is not None:
-                self._vector_class = self._distributed_vector_class
-            else:
-                simple_warning("The 'distributed' option is set to True for Component %s, "
-                               "but there is no distributed vector implementation (MPI/PETSc) "
-                               "available. The default non-distributed vectors will be used."
-                               % pathname)
-                self._vector_class = self._local_vector_class
-        else:
-            self._vector_class = self._local_vector_class
-
-    def _setup_var_data(self, recurse=True):
+    def _setup_var_data(self):
         """
         Compute the list of abs var names, abs/prom name maps, and metadata dictionaries.
-
-        Parameters
-        ----------
-        recurse : bool
-            Whether to call this method in subsystems.
         """
         global global_meta_names
         super(Component, self)._setup_var_data()
-        allprocs_abs_names = self._var_allprocs_abs_names
+
+        abs_names = self._var_abs_names = self._var_allprocs_abs_names
+        abs_names_discrete = self._var_abs_names_discrete = self._var_allprocs_abs_names_discrete
+
         allprocs_prom2abs_list = self._var_allprocs_prom2abs_list
-        abs2prom = self._var_abs2prom
+
+        abs2prom = self._var_allprocs_abs2prom = self._var_abs2prom
+
         allprocs_abs2meta = self._var_allprocs_abs2meta
         abs2meta = self._var_abs2meta
 
@@ -260,10 +228,9 @@ class Component(System):
         for type_ in ['input', 'output']:
             for prom_name in self._var_rel_names[type_]:
                 abs_name = prefix + prom_name
-                metadata = self._var_rel2meta[prom_name]
+                abs2meta[abs_name] = metadata = self._var_rel2meta[prom_name]
 
-                # Compute allprocs_abs_names, abs_names
-                allprocs_abs_names[type_].append(abs_name)
+                abs_names[type_].append(abs_name)
 
                 # Compute allprocs_prom2abs_list, abs2prom
                 allprocs_prom2abs_list[type_][prom_name] = [abs_name]
@@ -275,31 +242,33 @@ class Component(System):
                     for meta_name in global_meta_names[type_]
                 }
 
-                # Compute abs2meta
-                abs2meta[abs_name] = metadata
-
-            for prom_name, val in iteritems(self._var_discrete[type_]):
+            for prom_name, val in self._var_discrete[type_].items():
                 abs_name = prefix + prom_name
+
+                # Compute allprocs_abs_names_discrete
+                abs_names_discrete[type_].append(abs_name)
+
+                # Compute allprocs_prom2abs_list, abs2prom
                 allprocs_prom2abs_list[type_][prom_name] = [abs_name]
-                self._var_allprocs_discrete[type_][abs_name] = val
+                abs2prom[type_][abs_name] = prom_name
 
-        self._var_allprocs_abs2prom = self._var_abs2prom
+                # Compute allprocs_discrete (metadata for discrete vars)
+                self._var_allprocs_discrete[type_][abs_name] = v = val.copy()
+                del v['value']
 
-        self._var_abs_names = self._var_allprocs_abs_names
+        for abs_name in abs_names['input']:
+            allprocs_abs2meta[abs_name]['has_src_indices'] = \
+                abs2meta[abs_name]['src_indices'] is not None
+
         if self._var_discrete['input'] or self._var_discrete['output']:
             self._discrete_inputs = _DictValues(self._var_discrete['input'])
             self._discrete_outputs = _DictValues(self._var_discrete['output'])
         else:
             self._discrete_inputs = self._discrete_outputs = ()
 
-    def _setup_var_sizes(self, recurse=True):
+    def _setup_var_sizes(self):
         """
         Compute the arrays of local variable sizes for all variables/procs on this system.
-
-        Parameters
-        ----------
-        recurse : bool
-            Whether to call this method in subsystems.
         """
         super(Component, self)._setup_var_sizes()
 
@@ -348,21 +317,18 @@ class Component(System):
         if self._use_derivatives:
             self._var_sizes['nonlinear'] = self._var_sizes['linear']
 
+        self._owned_sizes = self._var_sizes['nonlinear']['output']
+
         self._setup_global_shapes()
 
-    def _setup_partials(self, recurse=True):
+    def _setup_partials(self):
         """
         Process all partials and approximations that the user declared.
-
-        Parameters
-        ----------
-        recurse : bool
-            Whether to call this method in subsystems.
         """
         self._subjacs_info = {}
         self._jacobian = DictionaryJacobian(system=self)
 
-        for key, dct in iteritems(self._declared_partials):
+        for key, dct in self._declared_partials.items():
             of, wrt = key
             self._declare_partials(of, wrt, dct)
 
@@ -405,9 +371,9 @@ class Component(System):
         """
         # sparsity uses relative names, so we need to convert to absolute
         pathname = self.pathname
-        for of, sub in iteritems(sparsity):
+        for of, sub in sparsity.items():
             of_abs = '.'.join((pathname, of)) if pathname else of
-            for wrt, tup in iteritems(sub):
+            for wrt, tup in sub.items():
                 wrt_abs = '.'.join((pathname, wrt)) if pathname else wrt
                 abs_key = (of_abs, wrt_abs)
                 if abs_key in self._subjacs_info:
@@ -415,7 +381,7 @@ class Component(System):
                     self._subjacs_info[abs_key]['sparsity'] = tup
 
     def add_input(self, name, val=1.0, shape=None, src_indices=None, flat_src_indices=None,
-                  units=None, desc=''):
+                  units=None, desc='', tags=None):
         """
         Add an input variable to the component.
 
@@ -443,26 +409,18 @@ class Component(System):
             during execution. Default is None, which means it is unitless.
         desc : str
             description of the variable
+        tags : str or list of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
         dict
             metadata for added variable
         """
-        if units == 'unitless':
-            warn_deprecation("Input '%s' has units='unitless' but 'unitless' "
-                             "has been deprecated. Use "
-                             "units=None instead.  Note that connecting a "
-                             "unitless variable to one with units is no longer "
-                             "an error, but will issue a warning instead." %
-                             name)
-            units = None
-
         # First, type check all arguments
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid input name." % (self.msginfo, name))
         if not isscalar(val) and not isinstance(val, (list, tuple, ndarray, Iterable)):
@@ -482,25 +440,31 @@ class Component(System):
         if units is not None and not valid_units(units):
             raise ValueError("%s: The units '%s' are invalid" % (self.msginfo, units))
 
-        metadata = {}
+        if tags is not None and not isinstance(tags, (str, list)):
+            raise TypeError('The tags argument should be a str or list')
 
         # value, shape: based on args, making sure they are compatible
-        metadata['value'], metadata['shape'], src_indices = ensure_compatible(name, val, shape,
-                                                                              src_indices)
-        metadata['size'] = np.prod(metadata['shape'])
+        value, shape, src_indices = ensure_compatible(name, val, shape, src_indices)
+        distributed = self.options['distributed']
 
-        # src_indices: None or ndarray
-        if src_indices is None:
-            metadata['src_indices'] = None
-        else:
-            metadata['src_indices'] = np.asarray(src_indices, dtype=INT_DTYPE)
-        metadata['flat_src_indices'] = flat_src_indices
+        metadata = {
+            'value': value,
+            'shape': shape,
+            'size': np.prod(shape),
+            'src_indices': None,
+            'flat_src_indices': flat_src_indices,
+            'units': units,
+            'desc': desc,
+            'distributed': distributed,
+            'tags': make_set(tags),
+        }
 
-        metadata['units'] = units
-        metadata['desc'] = desc
-        metadata['distributed'] = self.options['distributed']
+        if src_indices is not None:
+            if _is_slicer_op(src_indices):
+                metadata['src_indices'] = src_indices
+            else:
+                metadata['src_indices'] = np.asarray(src_indices, dtype=INT_DTYPE)
 
-        # We may not know the pathname yet, so we have to use name for now, instead of abs_name.
         if self._static_mode:
             var_rel2meta = self._static_var_rel2meta
             var_rel_names = self._static_var_rel_names
@@ -515,9 +479,11 @@ class Component(System):
         var_rel2meta[name] = metadata
         var_rel_names['input'].append(name)
 
+        self._var_added(name)
+
         return metadata
 
-    def add_discrete_input(self, name, val, desc=''):
+    def add_discrete_input(self, name, val, desc='', tags=None):
         """
         Add a discrete input variable to the component.
 
@@ -529,6 +495,9 @@ class Component(System):
             The initial value of the variable being added.
         desc : str
             description of the variable
+        tags : str or list of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
@@ -538,16 +507,20 @@ class Component(System):
         # First, type check all arguments
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid input name." % (self.msginfo, name))
+        if tags is not None and not isinstance(tags, (str, list)):
+            raise TypeError('%s: The tags argument should be a str or list' % self.msginfo)
 
         metadata = {
             'value': val,
             'type': type(val),
             'desc': desc,
+            'tags': make_set(tags),
         }
+
+        if metadata['type'] == np.ndarray:
+            metadata.update({'shape': val.shape})
 
         if self._static_mode:
             var_rel2meta = self._static_var_rel2meta
@@ -560,10 +533,12 @@ class Component(System):
 
         var_rel2meta[name] = self._var_discrete['input'][name] = metadata
 
+        self._var_added(name)
+
         return metadata
 
     def add_output(self, name, val=1.0, shape=None, units=None, res_units=None, desc='',
-                   lower=None, upper=None, ref=1.0, ref0=0.0, res_ref=1.0):
+                   lower=None, upper=None, ref=1.0, ref0=0.0, res_ref=1.0, tags=None):
         """
         Add an output variable to the component.
 
@@ -603,25 +578,17 @@ class Component(System):
         res_ref : float or ndarray
             Scaling parameter. The value in the user-defined res_units of this output's residual
             when the scaled value is 1. Default is 1.
+        tags : str or list of strs or set of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
         dict
             metadata for added variable
         """
-        if units == 'unitless':
-            warn_deprecation("Output '%s' has units='unitless' but 'unitless' "
-                             "has been deprecated. Use "
-                             "units=None instead.  Note that connecting a "
-                             "unitless variable to one with units is no longer "
-                             "an error, but will issue a warning instead." %
-                             name)
-            units = None
-
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid output name." % (self.msginfo, name))
         if not isscalar(val) and not isinstance(val, (list, tuple, ndarray, Iterable)):
@@ -648,37 +615,27 @@ class Component(System):
         if units is not None and not valid_units(units):
             raise ValueError("%s: The units '%s' are invalid" % (self.msginfo, units))
 
-        metadata = {}
+        if tags is not None and not isinstance(tags, (str, set, list)):
+            raise TypeError('The tags argument should be a str, set, or list')
 
         # value, shape: based on args, making sure they are compatible
-        metadata['value'], metadata['shape'], _ = ensure_compatible(name, val, shape)
-        metadata['size'] = np.prod(metadata['shape'])
-
-        # units, res_units: taken as is
-        metadata['units'] = units
-        metadata['res_units'] = res_units
-
-        # desc: taken as is
-        metadata['desc'] = desc
+        value, shape, _ = ensure_compatible(name, val, shape)
 
         if lower is not None:
-            lower = ensure_compatible(name, lower, metadata['shape'])[0]
+            lower = ensure_compatible(name, lower, shape)[0]
             self._has_bounds = True
         if upper is not None:
-            upper = ensure_compatible(name, upper, metadata['shape'])[0]
+            upper = ensure_compatible(name, upper, shape)[0]
             self._has_bounds = True
-
-        metadata['lower'] = lower
-        metadata['upper'] = upper
 
         # All refs: check the shape if necessary
         for item, item_name in zip([ref, ref0, res_ref], ['ref', 'ref0', 'res_ref']):
             if not isscalar(item):
                 it = atleast_1d(item)
-                if it.shape != metadata['shape']:
+                if it.shape != shape:
                     raise ValueError("{}: When adding output '{}', expected shape {} but got "
                                      "shape {} for argument '{}'.".format(self.msginfo, name,
-                                                                          metadata['shape'],
+                                                                          shape,
                                                                           it.shape, item_name))
 
         if isscalar(ref):
@@ -696,15 +653,21 @@ class Component(System):
         else:
             self._has_resid_scaling |= np.any(res_ref != 1.0)
 
-        ref = format_as_float_or_array('ref', ref, flatten=True)
-        ref0 = format_as_float_or_array('ref0', ref0, flatten=True)
-        res_ref = format_as_float_or_array('res_ref', res_ref, flatten=True)
-
-        metadata['ref'] = ref
-        metadata['ref0'] = ref0
-        metadata['res_ref'] = res_ref
-
-        metadata['distributed'] = self.options['distributed']
+        metadata = {
+            'value': value,
+            'shape': shape,
+            'size': np.prod(shape),
+            'units': units,
+            'res_units': res_units,
+            'desc': desc,
+            'distributed': self.options['distributed'],
+            'tags': make_set(tags),
+            'ref': format_as_float_or_array('ref', ref, flatten=True),
+            'ref0': format_as_float_or_array('ref0', ref0, flatten=True),
+            'res_ref': format_as_float_or_array('res_ref', res_ref, flatten=True),
+            'lower': lower,
+            'upper': upper,
+        }
 
         # We may not know the pathname yet, so we have to use name for now, instead of abs_name.
         if self._static_mode:
@@ -721,9 +684,11 @@ class Component(System):
         var_rel2meta[name] = metadata
         var_rel_names['output'].append(name)
 
+        self._var_added(name)
+
         return metadata
 
-    def add_discrete_output(self, name, val, desc=''):
+    def add_discrete_output(self, name, val, desc='', tags=None):
         """
         Add an output variable to the component.
 
@@ -735,6 +700,9 @@ class Component(System):
             The initial value of the variable being added.
         desc : str
             description of the variable.
+        tags : str or list of strs or set of strs
+            User defined tags that can be used to filter what gets listed when calling
+            list_inputs and list_outputs.
 
         Returns
         -------
@@ -743,16 +711,20 @@ class Component(System):
         """
         if not isinstance(name, str):
             raise TypeError('%s: The name argument should be a string.' % self.msginfo)
-        if not name:
-            raise NameError('%s: The name argument should be a non-empty string.' % self.msginfo)
         if not _valid_var_name(name):
             raise NameError("%s: '%s' is not a valid output name." % (self.msginfo, name))
+        if tags is not None and not isinstance(tags, (str, set, list)):
+            raise TypeError('%s: The tags argument should be a str, set, or list' % self.msginfo)
 
         metadata = {
             'value': val,
             'type': type(val),
-            'desc': desc
+            'desc': desc,
+            'tags': make_set(tags)
         }
+
+        if metadata['type'] == np.ndarray:
+            metadata.update({'shape': val.shape})
 
         if self._static_mode:
             var_rel2meta = self._static_var_rel2meta
@@ -765,7 +737,78 @@ class Component(System):
 
         var_rel2meta[name] = self._var_discrete['output'][name] = metadata
 
+        self._var_added(name)
+
         return metadata
+
+    def _var_added(self, name):
+        """
+        Notify config that a variable has been added to this Component.
+
+        Parameters
+        ----------
+        name : str
+            Name of the added variable.
+        """
+        if self._problem_meta is not None and self._problem_meta['config_info'] is not None:
+            self._problem_meta['config_info']._var_added(self.pathname, name)
+
+    def _update_dist_src_indices(self, abs_in2out, all_abs2meta, all_abs2idx, all_sizes):
+        """
+        Set default src_indices on distributed components for any inputs where they aren't set.
+
+        Parameters
+        ----------
+        abs_in2out : dict
+            Mapping of connected inputs to their source.  Names are absolute.
+        all_abs2meta : dict
+            Mapping of absolute names to metadata for all variables in the model.
+        all_abs2idx : dict
+            Dictionary mapping an absolute name to its allprocs variable index.
+        all_sizes : dict
+            Mapping of vec_names and types to sizes of each variable in all procs.
+
+        Returns
+        -------
+        set
+            Names of inputs where src_indices were added.
+        """
+        if not self.options['distributed'] or self.comm.size == 1:
+            return set()
+
+        iproc = self.comm.rank
+        abs2meta = self._var_abs2meta
+
+        sizes_in = self._var_sizes['nonlinear']['input']
+        sizes_out = all_sizes['nonlinear']['output']
+        added_src_inds = set()
+        for i, iname in enumerate(self._var_allprocs_abs_names['input']):
+            if iname in abs2meta and abs2meta[iname]['src_indices'] is None:
+                src = abs_in2out[iname]
+                out_i = all_abs2idx[src]
+                nzs = np.nonzero(sizes_out[:, out_i])[0]
+                if (all_abs2meta[src]['global_size'] == all_abs2meta[iname]['global_size'] or
+                        nzs.size == self.comm.size):
+                    # This offset assumes a 'full' distributed output
+                    offset = np.sum(sizes_in[:iproc, i])
+                    end = offset + sizes_in[iproc, i]
+                else:  # distributed output (may have some zero size entries)
+                    if nzs.size == 1:
+                        offset = 0
+                        end = sizes_out[nzs[0], out_i]
+                    else:
+                        # total sizes differ and output is distributed, so can't determine mapping
+                        raise RuntimeError(f"{self.msginfo}: Can't determine src_indices "
+                                           f"automatically for input '{iname}'. They must be "
+                                           "supplied manually.")
+                simple_warning(f"{self.msginfo}: Component is distributed but input '{iname}' was "
+                               "added without src_indices. Setting src_indices to "
+                               f"range({offset}, {end}).")
+                abs2meta[iname]['src_indices'] = np.arange(offset, end, dtype=INT_DTYPE)
+                all_abs2meta[iname]['has_src_indices'] = True
+                added_src_inds.add(iname)
+
+        return added_src_inds
 
     def _approx_partials(self, of, wrt, method='fd', **kwargs):
         """
@@ -893,7 +936,7 @@ class Component(System):
                 # Check for repeated rows/cols indices.
                 idxset = set(zip(rows, cols))
                 if len(rows) - len(idxset) > 0:
-                    dups = [n for n, val in iteritems(Counter(zip(rows, cols))) if val > 1]
+                    dups = [n for n, val in Counter(zip(rows, cols)).items() if val > 1]
                     raise RuntimeError("{}: d({})/d({}): declare_partials has been called "
                                        "with rows and cols that specify the following duplicate "
                                        "subjacobian entries: {}.".format(self.msginfo, of, wrt,
@@ -945,6 +988,7 @@ class Component(System):
                          tol=_DEFAULT_COLORING_META['tol'],
                          orders=_DEFAULT_COLORING_META['orders'],
                          perturb_size=_DEFAULT_COLORING_META['perturb_size'],
+                         min_improve_pct=_DEFAULT_COLORING_META['min_improve_pct'],
                          show_summary=_DEFAULT_COLORING_META['show_summary'],
                          show_sparsity=_DEFAULT_COLORING_META['show_sparsity']):
         """
@@ -975,6 +1019,9 @@ class Component(System):
             Number of orders above and below the tolerance to check during the tolerance sweep.
         perturb_size : float
             Size of input/output perturbation during generation of sparsity.
+        min_improve_pct : float
+            If coloring does not improve (decrease) the number of solves more than the given
+            percentage, coloring will not be used.
         show_summary : bool
             If True, display summary information after generating coloring.
         show_sparsity : bool
@@ -982,7 +1029,7 @@ class Component(System):
         """
         super(Component, self).declare_coloring(wrt, method, form, step, per_instance,
                                                 num_full_jacs,
-                                                tol, orders, perturb_size,
+                                                tol, orders, perturb_size, min_improve_pct,
                                                 show_summary, show_sparsity)
         # create approx partials for all matches
         meta = self.declare_partials('*', wrt, method=method, step=step, form=form)
@@ -1028,7 +1075,7 @@ class Component(System):
             msg = "{}: The value of 'step_calc' must be one of {}, but '{}' was specified."
             raise ValueError(msg.format(self.msginfo, supported_step_calc, step_calc))
 
-        if not isinstance(wrt, (string_types, list, tuple)):
+        if not isinstance(wrt, (str, list, tuple)):
             msg = "{}: The value of 'wrt' must be a string or list of strings, but a type " \
                   "of '{}' was provided."
             raise ValueError(msg.format(self.msginfo, type(wrt).__name__))
@@ -1038,15 +1085,20 @@ class Component(System):
                   "of '{}' was provided."
             raise ValueError(msg.format(self.msginfo, type(directional).__name__))
 
-        wrt_list = [wrt] if isinstance(wrt, string_types) else wrt
+        wrt_list = [wrt] if isinstance(wrt, str) else wrt
         self._declared_partial_checks.append((wrt_list, method, form, step, step_calc,
                                               directional))
 
-    def _get_check_partial_options(self):
+    def _get_check_partial_options(self, include_wrt_outputs=True):
         """
         Return dictionary of partial options with pattern matches processed.
 
         This is called by check_partials.
+
+        Parameters
+        ----------
+        include_wrt_outputs : bool
+            If True, include outputs in the wrt list.
 
         Returns
         -------
@@ -1054,8 +1106,12 @@ class Component(System):
             Dictionary keyed by name with tuples of options (method, form, step, step_calc)
         """
         opts = {}
-        of, wrt = self._get_potential_partials_lists()
+        of, wrt = self._get_potential_partials_lists(include_wrt_outputs=include_wrt_outputs)
         invalid_wrt = []
+        matrix_free = self.matrix_free
+
+        if matrix_free:
+            n_directional = 0
 
         for wrt_list, method, form, step, step_calc, directional in self._declared_partial_checks:
             for pattern in wrt_list:
@@ -1083,9 +1139,18 @@ class Component(System):
                                        'step_calc': step_calc,
                                        'directional': directional}
 
+                    if matrix_free and directional:
+                        n_directional += 1
+
         if invalid_wrt:
             msg = "{}: Invalid 'wrt' variables specified for check_partial options: {}."
             raise ValueError(msg.format(self.msginfo, invalid_wrt))
+
+        if matrix_free:
+            if n_directional > 0 and n_directional < len(wrt):
+                msg = "{}: For matrix free components, directional should be set to True for " + \
+                      "all inputs."
+                raise ValueError(msg.format(self.msginfo))
 
         return opts
 
@@ -1193,6 +1258,23 @@ class Component(System):
                 meta['cols'] = cols
                 meta['shape'] = shape = (abs2meta[abs_key[0]]['size'], abs2meta[abs_key[1]]['size'])
 
+                if shape[0] == 0 or shape[1] == 0:
+                    msg = "{}: '{}' is an array of size 0"
+                    if shape[0] == 0:
+                        if not abs2meta[abs_key[0]]['distributed']:
+                            # non-distributed components are not allowed to have zero size inputs
+                            raise ValueError(msg.format(self.msginfo, abs_key[0]))
+                        else:
+                            # distributed comp are allowed to have zero size inputs on some procs
+                            rows_max = -1
+                    if shape[1] == 0:
+                        if not abs2meta[abs_key[1]]['distributed']:
+                            # non-distributed components are not allowed to have zero size outputs
+                            raise ValueError(msg.format(self.msginfo, abs_key[1]))
+                        else:
+                            # distributed comp are allowed to have zero size outputs on some procs
+                            cols_max = -1
+
                 if val is None:
                     # we can only get here if rows is None  (we're not sparse list format)
                     meta['value'] = np.zeros(shape)
@@ -1238,8 +1320,8 @@ class Component(System):
             where of_matches is a list of tuples (pattern, matches) and wrt_matches is a list of
             tuples (pattern, output_matches, input_matches).
         """
-        of_list = [of] if isinstance(of, string_types) else of
-        wrt_list = [wrt] if isinstance(wrt, string_types) else wrt
+        of_list = [of] if isinstance(of, str) else of
+        wrt_list = [wrt] if isinstance(wrt, str) else wrt
         of, wrt = self._get_potential_partials_lists()
 
         of_pattern_matches = [(pattern, find_matches(pattern, of)) for pattern in of_list]
@@ -1306,10 +1388,9 @@ class Component(System):
         if self._first_call_to_linearize:
             self._first_call_to_linearize = False  # only do this once
             if coloring_mod._use_partial_sparsity:
-                is_dynamic = self._coloring_info['coloring'] is coloring_mod._DYN_COLORING
                 coloring = self._get_coloring()
                 if coloring is not None:
-                    if not is_dynamic:
+                    if not self._coloring_info['dynamic']:
                         coloring._check_config_partial(self)
                     self._update_subjac_sparsity(coloring.get_subjac_sparsity())
 

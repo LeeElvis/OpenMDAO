@@ -14,7 +14,7 @@ or a portion of its data into a scaled or unscaled state when requested. Doing s
 addition with a vector of adders.  There is a small amount of cost to this, so OpenMDAO tries to scale/unscale only when necessary and only over
 as tight a scope as required.
 
-Scaling is used primarily as an aid to solver convergence (both linear and nonlinear). Whenver a user interacts with OpenMDAO, or whenever a component
+Scaling is used primarily as an aid to solver convergence (both linear and nonlinear). Whenever a user interacts with OpenMDAO, or whenever a component
 calls a user-written function like "compute", the vectors will always be in an unscaled state. The following tables summarize this:
 
 **outputs and residuals (linear and nonlinear) are in an unscaled state**
@@ -30,7 +30,7 @@ calls a user-written function like "compute", the vectors will always be in an u
 
  - During solver iteration (computing next step, determining convergence)
  - When data is passed from outputs to inputs
- - When OpenMDAO loops over the model hieararchy
+ - When OpenMDAO loops over the model hierarchy
 
 The scaling system is also used to handle unit conversion. This proves to be a good fit because every unit in the unit library can be represented
 as a multiplication and an addition.  Unit conversion happens upon the passing of data from outputs to inputs. You cannot specify scaling for
@@ -46,8 +46,7 @@ in this theory document.
 Scenarios: run_model
 ---------------------
 
-This sequence diagram shows the simplest possible operation -- executing a single explicit component with an input that comes from an IndepVarComp
-and solved using the RunOnce solver.  It shows how the outputs and residuals vectors are placed into an unscaled state right before compute is
+This sequence diagram shows the simplest possible operation -- executing a single explicit component and solving using the RunOnce solver.  It shows how the outputs and residuals vectors are placed into an unscaled state right before compute is
 called on the `Paraboloid`. You can also see where unit conversion takes places during data passing.
 
 .. figure:: sequence_diagrams/scaling_run_model.png

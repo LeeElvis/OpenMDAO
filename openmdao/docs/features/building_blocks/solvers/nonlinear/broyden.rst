@@ -5,14 +5,14 @@ BroydenSolver
 *************
 
 BroydenSolver is a quasi-Newton solver that implements Broyden's second method to solve for values of the model's states that
-drive their residuals to zero. It does so by maintaning an approximation to the inverse of the Jacobian of the model or a subset
+drive their residuals to zero. It does so by maintaining an approximation to the inverse of the Jacobian of the model or a subset
 of the model. In some cases this can be more efficient than NewtonSolver because updating the approximated inverse Jacobian is
 cheaper than solving the linear system. It may take more iterations because the search direction depends on an approximation,
 but the iterations take fewer operations.
 
 The BroydenSolver has two different modes of operation. It can operate on the entire model and solve for every state in the containing
 system and all subsystems. Alternatively, it can operate on a subset of the model and only solve for a list of states that you provide.
-The advanatage of full-model mode is that you don't have to worry about forgetting a state, particularly in large models where you might
+The advantage of full-model mode is that you don't have to worry about forgetting a state, particularly in large models where you might
 not be familiar with every component or variable. The disadvantage is that you are computing the inverse of a larger matrix every time
 you recalculate the inverse jacobian, though ideally you are not recomputing this very often. Operating on a subset of states is more
 efficient in both the linear solve and the Broyden update, but you do run the risk of missing a state. The BroydenSolver will print a
@@ -29,6 +29,14 @@ BroydenSolver Options
 
 The BroydenSolver also contains a slot for a linear solver and a slot for a linesearch. See the
 :ref:`feature doc about linesearches <feature_line_search>` for more about these.
+
+BroydenSolver Constructor
+-------------------------
+
+The call signature for the `BroydenSolver` constructor is:
+
+.. automethod:: openmdao.solvers.nonlinear.broyden.BroydenSolver.__init__
+    :noindex:
 
 
 BroydenSolver on a Full Model
@@ -98,3 +106,24 @@ number of iterations, though keep in mind that solving for the derivatives adds 
   .. embed-code::
       openmdao.solvers.nonlinear.tests.test_broyden.TestBryodenFeature.test_circuit_options
       :layout: code, output
+
+**stall_limit and stall_tol**
+
+  In some cases, nonlinear solvers can stall out where the norm of the residual stops changing at all. This
+  can happen for a couple of reasons. You can hit numerical noise problems and just be wandering around in
+  a circle, or you can get stuck on a bound and the line search just keeps running into the same spot no
+  matter what. Either way, if you have say 100 max iterations and you stall at 15 ... you waste a lot of
+  compute time. To remedy this, you can turn on stall detection in all nonlinear solvers by setting the
+  "stall_limit" option to a number greater than zero.
+
+  In this example, we set stall_limit to 3. While the solver iterates, it will compare the value of the
+  residual norm to the value computed in the previous iteration.  If the value matches for three iterations
+  in a row, then iteration will terminate due to detection of a stall. If "err_on_non_converge" is set
+  to True, then an ``AnalysisError`` will be raised just as if we had reached the iteration count limit.
+
+  We also set the `stall_tol` to 1e-6, which is the threshold below which a change in the relative residual
+  norm is considered to be unchanged.
+
+  .. embed-code::
+      openmdao.solvers.tests.test_solver_features.TestSolverFeatures.test_feature_stall_detection_broyden
+      :layout: interleave

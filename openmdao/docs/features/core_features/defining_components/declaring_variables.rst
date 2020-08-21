@@ -85,3 +85,11 @@ Usage
   .. embed-code::
       openmdao.core.tests.test_add_var.TestAddVar.test_bounds
       :layout: interleave
+
+7. Adding tags to input and output variables. These tags can then be used to filter what gets
+     returned from the :code:`System.get_io_metadata` method and displayed/returned from the
+     :code:`System.list_inputs` and :code:`System.list_outputs` methods.
+
+  .. embed-code::
+      openmdao.core.tests.test_expl_comp.ExplCompTestCase.test_feature_simple_var_tags
+      :layout: interleave

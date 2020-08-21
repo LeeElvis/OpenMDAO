@@ -1,4 +1,3 @@
-from __future__ import division
 import numpy as np
 
 import openmdao.api as om
@@ -6,7 +5,6 @@ import openmdao.api as om
 from openmdao.test_suite.test_examples.beam_optimization.components.moment_comp import MomentOfInertiaComp
 from openmdao.test_suite.test_examples.beam_optimization.components.local_stiffness_matrix_comp import LocalStiffnessMatrixComp
 from openmdao.test_suite.test_examples.beam_optimization.components.states_comp import StatesComp
-from openmdao.test_suite.test_examples.beam_optimization.components.displacements_comp import DisplacementsComp
 from openmdao.test_suite.test_examples.beam_optimization.components.compliance_comp import ComplianceComp
 from openmdao.test_suite.test_examples.beam_optimization.components.volume_comp import VolumeComp
 
@@ -31,12 +29,8 @@ class BeamGroup(om.Group):
         force_vector = np.zeros(2 * num_nodes)
         force_vector[-2] = -1.
 
-        inputs_comp = om.IndepVarComp()
-        inputs_comp.add_output('h', shape=num_elements)
-        self.add_subsystem('inputs_comp', inputs_comp)
-
         I_comp = MomentOfInertiaComp(num_elements=num_elements, b=b)
-        self.add_subsystem('I_comp', I_comp)
+        self.add_subsystem('I_comp', I_comp, promotes_inputs=['h'])
 
         comp = LocalStiffnessMatrixComp(num_elements=num_elements, E=E, L=L)
         self.add_subsystem('local_stiffness_matrix_comp', comp)
@@ -44,30 +38,17 @@ class BeamGroup(om.Group):
         comp = StatesComp(num_elements=num_elements, force_vector=force_vector)
         self.add_subsystem('states_comp', comp)
 
-        comp = DisplacementsComp(num_elements=num_elements)
-        self.add_subsystem('displacements_comp', comp)
-
         comp = ComplianceComp(num_elements=num_elements, force_vector=force_vector)
         self.add_subsystem('compliance_comp', comp)
 
         comp = VolumeComp(num_elements=num_elements, b=b, L=L)
-        self.add_subsystem('volume_comp', comp)
+        self.add_subsystem('volume_comp', comp, promotes_inputs=['h'])
 
-        self.connect('inputs_comp.h', 'I_comp.h')
         self.connect('I_comp.I', 'local_stiffness_matrix_comp.I')
-        self.connect(
-            'local_stiffness_matrix_comp.K_local',
-            'states_comp.K_local')
-        self.connect(
-            'states_comp.d',
-            'displacements_comp.d')
-        self.connect(
-            'displacements_comp.displacements',
-            'compliance_comp.displacements')
-        self.connect(
-            'inputs_comp.h',
-            'volume_comp.h')
+        self.connect('local_stiffness_matrix_comp.K_local', 'states_comp.K_local')
+        self.connect('states_comp.d', 'compliance_comp.displacements',
+                     src_indices=np.arange(2 *num_nodes))
 
-        self.add_design_var('inputs_comp.h', lower=1e-2, upper=10.)
+        self.add_design_var('h', lower=1e-2, upper=10.)
         self.add_objective('compliance_comp.compliance')
         self.add_constraint('volume_comp.volume', equals=volume)
